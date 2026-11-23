@@ -16,10 +16,6 @@ object ApiClient {
     private val executor = Executors.newSingleThreadExecutor()
     private val pollExecutor = Executors.newSingleThreadExecutor()
 
-    // Dashboard/report traffic must never queue ahead of SMS send-result,
-    // delivery-receipt, activation, or device-control requests.
-    private val reportExecutor = Executors.newSingleThreadExecutor()
-
     private const val CONNECT_TIMEOUT = 15000
     // Main Server currently long-polls for up to 15 seconds. Keep a generous
     // read timeout for shared-hosting latency without allowing an endless call.
@@ -721,7 +717,7 @@ object ApiClient {
         endpoint: String,
         callback: (Result<JSONObject>) -> Unit
     ) {
-        reportExecutor.execute {
+        executor.execute {
             val result = runCatching {
                 request(
                     endpoint = buildEndpoint(
