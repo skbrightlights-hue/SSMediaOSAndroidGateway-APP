@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
@@ -30,10 +31,18 @@ class GatewayService : Service() {
     @Volatile
     private var resultReporting = false
 
+    // Timestamp only for the HTTP queue-poll request, not for SMS sending/result reporting.
+    @Volatile
+    private var pollStartedAtMs = 0L
+
     private val handler = Handler(Looper.getMainLooper())
 
     private var currentStartId = 0
     private var receiverRegistered = false
+
+    // Keep the CPU awake while the user has explicitly enabled the always-on SMS gateway.
+    // Released whenever the foreground service stops or is destroyed.
+    private var gatewayWakeLock: PowerManager.WakeLock? = null
 
     private val statusPrefsName = "ss_mediaos_gateway_status"
 
@@ -48,15 +57,66 @@ class GatewayService : Service() {
     private val smsJobs =
         ConcurrentHashMap<Long, SmsJobState>()
 
+    /**
+     * Keep a claimed job's final result until the Main Server acknowledges it.
+     */
+    private data class PendingGatewayResult(
+        val jobId: Long,
+        val requestId: String,
+        val success: Boolean,
+        val errorCode: String?
+    )
+
+    private val pendingResultLock = Any()
+
+    /**
+     * Poll watchdog.
+     *
+     * Keep scheduling independently of the HTTP callback. Earlier versions
+     * scheduled the next poll only from inside the callback. If a callback
+     * threw before reaching its scheduling line, polling could stop while
+     * the foreground service still appeared active.
+     */
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!serviceRunning) return
 
-            if (!requestInProgress) {
-                pollServer()
-            }
+            try {
+                val pollStarted = pollStartedAtMs
+                if (
+                    requestInProgress &&
+                    pollStarted > 0L &&
+                    System.currentTimeMillis() - pollStarted > POLL_REQUEST_STALE_MS
+                ) {
+                    // The HTTP poll should finish within ApiClient's 30-second
+                    // read timeout. Recover only a stale poll lock; do not
+                    // interfere with an SMS currently being sent or reported.
+                    Log.e(TAG, "Stale Main Server poll lock detected; restarting poll loop")
+                    pollStartedAtMs = 0L
+                    requestInProgress = false
+                    setServerState(STATE_FAILED)
+                    updateStatus("Poll timed out — reconnecting to Main Server")
+                }
 
-            handler.postDelayed(this, POLL_INTERVAL_MS)
+                if (!requestInProgress) {
+                    pollServer()
+                }
+            } catch (exception: Exception) {
+                Log.e(TAG, "Unexpected error in SMS poll loop", exception)
+                requestInProgress = false
+                setServerState(STATE_FAILED)
+                updateStatus(
+                    "Poll loop error: " +
+                        (exception.message ?: exception.javaClass.simpleName)
+                            .replace(Regex("[\\r\\n\\t]+"), " ")
+                            .take(180)
+                )
+            } finally {
+                if (serviceRunning) {
+                    handler.removeCallbacks(this)
+                    handler.postDelayed(this, POLL_WATCHDOG_INTERVAL_MS)
+                }
+            }
         }
     }
 
@@ -206,14 +266,36 @@ class GatewayService : Service() {
         when (intent?.action) {
 
             ACTION_STOP -> {
-                Log.i(TAG, "Gateway stop requested")
+                // An explicit user stop is the only normal action that clears
+                // the persistent auto-start preference.
+                Log.i(TAG, "Gateway stop requested by user")
+                getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_GATEWAY_ENABLED, false)
+                    .commit()
                 stopGateway()
                 return START_NOT_STICKY
             }
 
-            ACTION_START, null -> {
+            ACTION_START -> {
                 currentStartId = startId
                 startGateway(startId)
+            }
+
+            null -> {
+                // Android may recreate a START_STICKY service with a null intent.
+                // Resume only if the user had previously enabled the gateway.
+                val enabled = getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                    .getBoolean(PREF_GATEWAY_ENABLED, false)
+                if (enabled) {
+                    Log.i(TAG, "Restoring previously enabled Gateway after process restart")
+                    currentStartId = startId
+                    startGateway(startId)
+                } else {
+                    Log.i(TAG, "Ignoring sticky restart because Gateway is disabled")
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
             }
 
             else -> {
@@ -223,11 +305,9 @@ class GatewayService : Service() {
             }
         }
 
-        return if (serviceRunning) {
-            START_STICKY
-        } else {
-            START_NOT_STICKY
-        }
+        // Keep the service eligible for Android's sticky restart when the OS
+        // reclaims the process. It is not a promise against Force Stop/OEM kills.
+        return if (serviceRunning || isGatewayEnabled()) START_STICKY else START_NOT_STICKY
     }
 
     private fun registerSmsResultReceiver() {
@@ -263,31 +343,53 @@ class GatewayService : Service() {
             return
         }
 
-        val serverUrl = SecureConfig.getServerUrl(this)
-        val deviceCode = SecureConfig.getDeviceCode(this)
-        val companyApiKey = SecureConfig.getCompanyApiKey(this)
-        val deviceToken = SecureConfig.getDeviceToken(this)
+        // Clear the resume marker while validating a fresh start. It is set
+        // again only after all prerequisites pass and foreground mode begins.
+        getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_GATEWAY_ENABLED, false)
+            .commit()
+
+        val serverUrl: String = SecureConfig.getServerUrl(this).orEmpty().trim()
+        val deviceCode: String = SecureConfig.getDeviceCode(this).orEmpty().trim()
+        val companyApiKey: String = SecureConfig.getCompanyApiKey(this).orEmpty().trim()
+        val deviceToken: String = SecureConfig.getDeviceToken(this).orEmpty().trim()
 
         if (
-            serverUrl.isNullOrBlank() ||
-            deviceCode.isNullOrBlank() ||
-            companyApiKey.isNullOrBlank()
+            serverUrl.isBlank() ||
+            deviceCode.isBlank() ||
+            companyApiKey.isBlank()
         ) {
             Log.w(TAG, "Gateway start blocked: required settings missing")
 
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
+            updateStatus("Gateway not started: save the Main Server URL, Device Code and Company API Key first")
 
             stopSelf(startId)
             return
         }
 
         if (!SecureConfig.isOrganizationVerified(this)) {
-            Log.w(TAG, "Gateway start blocked: organization/mobile is not verified")
+            Log.w(TAG, "Gateway start blocked: institution/mobile is not verified")
 
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
-            updateStatus("Organization and registered mobile must be verified first")
+            updateStatus("Gateway not started: verify the institution and registered mobile first")
+            stopSelf(startId)
+            return
+        }
+
+        // A gateway must be bound to exactly one verified institution.
+        // Do not start polling if the authoritative institution identity is incomplete.
+        val verifiedInstitutionId = SecureConfig.getOrganizationId(this).trim()
+        val verifiedInstitutionName = SecureConfig.getOrganizationName(this).trim()
+        val verifiedInstitutionCode = SecureConfig.getOrganizationCode(this).trim()
+        if (verifiedInstitutionId.isBlank() || verifiedInstitutionName.isBlank() || verifiedInstitutionCode.isBlank()) {
+            Log.w(TAG, "Gateway start blocked: verified institution identity is incomplete")
+            saveServiceRunning(false)
+            setServerState(STATE_FAILED)
+            updateStatus("Institution ID, name and code must be verified first")
             stopSelf(startId)
             return
         }
@@ -302,11 +404,12 @@ class GatewayService : Service() {
             return
         }
 
-        if (deviceToken.isNullOrBlank()) {
+        if (deviceToken.isBlank()) {
             Log.w(TAG, "Gateway start blocked: device is not activated")
 
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
+            updateStatus("Gateway not started: activate this device with Main Server first")
 
             stopSelf(startId)
             return
@@ -320,6 +423,7 @@ class GatewayService : Service() {
 
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
+            updateStatus("Gateway not started: allow SMS permission in Android App Settings")
 
             stopSelf(startId)
             return
@@ -352,9 +456,17 @@ class GatewayService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
+            // Persist the user's intent only after every local prerequisite passed
+            // and foreground promotion succeeded.
+            getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_GATEWAY_ENABLED, true)
+                .commit()
+
             serviceRunning = true
             requestInProgress = false
             resultReporting = false
+            acquireGatewayWakeLock()
 
             saveServiceRunning(true)
             setServerState(STATE_CONNECTING)
@@ -371,7 +483,12 @@ class GatewayService : Service() {
 
             serviceRunning = false
             requestInProgress = false
+            releaseGatewayWakeLock()
 
+            getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_GATEWAY_ENABLED, false)
+                .commit()
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
 
@@ -398,10 +515,19 @@ class GatewayService : Service() {
     private fun pollServer() {
         if (!serviceRunning || requestInProgress) return
 
+        // Report a previously claimed job before claiming another one.
+        if (loadPendingResult() != null) {
+            sendPendingResult()
+            return
+        }
+
         requestInProgress = true
+        pollStartedAtMs = System.currentTimeMillis()
         setServerState(STATE_CONNECTING)
 
         ApiClient.pollGatewayJob { result ->
+
+            pollStartedAtMs = 0L
 
             if (!serviceRunning) {
                 requestInProgress = false
@@ -418,6 +544,7 @@ class GatewayService : Service() {
 
                         setServerState(STATE_FAILED)
                         updateStatus("Invalid server response")
+                        scheduleRetryPoll()
 
                         return@fold
                     }
@@ -425,56 +552,89 @@ class GatewayService : Service() {
                     // Server has accepted the authenticated poll request.
                     setServerState(STATE_CONNECTED)
 
+                    val diagnosticCode = response.optString("diagnostic_code", "POLL_OK")
+                        .ifBlank { "POLL_OK" }
+                    val diagnosticMessage = response.optString("diagnostic_message", "")
+                        .replace(Regex("[\r\n\t]+"), " ")
+                        .take(220)
+                    val nextAction = response.optString("next_action", "")
+                        .replace(Regex("[\r\n\t]+"), " ")
+                        .take(180)
+
+                    Log.i(
+                        TAG,
+                        "Main Server poll accepted: http=${response.optInt("_httpStatus", 200)}, " +
+                            "poll_request_id=${response.optString("poll_request_id", "")}, " +
+                            "code=$diagnosticCode, " +
+                            "device=${response.optJSONObject("device")?.optString("code", "unknown")}, " +
+                            "message=$diagnosticMessage, next=$nextAction"
+                    )
+
                     if (job == null) {
                         requestInProgress = false
-                        updateStatus("Connected — waiting for SMS jobs")
+                        if (response.optBoolean("busy", false)) {
+                            updateStatus("Connected — previous SMS result is pending")
+                            // Avoid rapid empty responses while Main Server is
+                            // holding a job in `sending` state.
+                            scheduleRetryPoll()
+                        } else {
+                            val visibleDiagnostic = when (diagnosticCode) {
+                                "SMS_ASSIGNED_TO_DIFFERENT_DEVICE" -> "SMS queue is assigned to another device"
+                                "QUEUED_JOB_NOT_CLAIMED" -> "SMS is queued but Main Server could not claim it"
+                                "NO_QUEUED_SMS_FOR_DEVICE" -> "Connected — no SMS assigned to this device"
+                                else -> diagnosticMessage.ifBlank { "Connected — waiting for SMS jobs" }
+                            }
+                            updateStatus(visibleDiagnostic)
+                            // Keep one long-poll request active continuously. The Main
+                            // Server returns immediately when a new queue row appears.
+                            scheduleImmediatePoll()
+                        }
                         return@fold
                     }
 
+                    updateStatus("SMS job received from Main Server — preparing selected SIM")
                     processJob(job)
                 },
 
                 onFailure = { exception ->
                     requestInProgress = false
 
-                    Log.e(
-                        TAG,
-                        "Gateway polling failed (${exception.javaClass.simpleName})"
-                    )
+                    val detail = exception.message
+                        ?.replace(Regex("[\r\n\t]+"), " ")
+                        ?.take(220)
+                        ?.ifBlank { exception.javaClass.simpleName }
+                        ?: exception.javaClass.simpleName
+
+                    Log.e(TAG, "Gateway polling failed: $detail", exception)
 
                     setServerState(STATE_FAILED)
-                    updateStatus("Server connection failed — retrying")
+                    updateStatus("Main Server poll failed: $detail — retrying")
+                    scheduleRetryPoll()
                 }
             )
         }
     }
 
     /**
+     * Keep this rule identical to message_enqueue.php:
+     * ignore only underscore, hyphen and whitespace; compare case-insensitively.
+     */
+    private fun normalizeInstitutionCode(value: String): String {
+        return value.trim()
+            .replace(Regex("[_\\-\\s]+"), "")
+            .uppercase(java.util.Locale.ROOT)
+    }
+
+    /**
      * Validate a claimed server job and submit it to Android.
      */
     private fun processJob(job: JSONObject) {
-
-        // Re-check immediately before each SMS job, not only when the service starts.
-        // This prevents queued jobs from sending after verification/SIM settings change.
-        if (!SecureConfig.isOrganizationVerified(this)) {
-            Log.w(TAG, "SMS job blocked: organization/mobile is not verified")
-            requestInProgress = false
-            updateStatus("SMS blocked: verify organization and registered mobile")
-            return
-        }
-
-        val selectedSubscriptionId = SecureConfig.getSelectedSimSubscriptionId(this)
-        if (selectedSubscriptionId == null) {
-            Log.w(TAG, "SMS job blocked: no SIM is selected")
-            requestInProgress = false
-            updateStatus("SMS blocked: select an assigned SIM")
-            return
-        }
-
+        // Validate the server claim first so every identifiable claimed job can
+        // receive a terminal result instead of being silently abandoned.
         val jobId = job.optLong("id", 0L)
-        val requestId = job.optString("request_id").trim()
-        val phoneNumber = job.optString("to").trim()
-        val message = job.optString("message")
+        val requestId = job.optString("request_id", "").orEmpty().trim()
+        val phoneNumber = job.optString("to", "").orEmpty().trim()
+        val message = job.optString("message", "").orEmpty()
 
         if (
             jobId <= 0L ||
@@ -483,22 +643,52 @@ class GatewayService : Service() {
             message.isBlank()
         ) {
             Log.e(TAG, "Received invalid SMS job")
+            rejectClaimedJob(jobId, requestId, "INVALID_JOB", "Invalid SMS job received")
+            return
+        }
 
-            if (
-                jobId > 0L &&
-                requestId.matches(Regex("^[a-f0-9]{32}$"))
-            ) {
-                reportResult(
-                    jobId = jobId,
-                    requestId = requestId,
-                    success = false,
-                    errorCode = "INVALID_JOB"
-                )
-            } else {
-                requestInProgress = false
-                updateStatus("Invalid job received — check server")
-            }
+        // Re-check authorization immediately before every send. If a claimed
+        // job cannot be sent, report a failure to Main Server so it is not left
+        // indefinitely in a claimed/processing state.
+        if (!SecureConfig.isOrganizationVerified(this)) {
+            Log.w(TAG, "SMS job blocked: organization/mobile is not verified")
+            rejectClaimedJob(
+                jobId, requestId, "ORGANIZATION_NOT_VERIFIED",
+                "SMS blocked: verify organization and registered mobile"
+            )
+            return
+        }
 
+        val selectedSubscriptionId = SecureConfig.getSelectedSimSubscriptionId(this)
+        if (selectedSubscriptionId == null) {
+            Log.w(TAG, "SMS job blocked: no SIM is selected")
+            rejectClaimedJob(
+                jobId, requestId, "SIM_NOT_SELECTED",
+                "SMS blocked: select an assigned SIM"
+            )
+            return
+        }
+
+        // Tenant isolation is enforced by Main Server before a job is returned:
+        // device_poll.php authenticates this device token and only claims rows
+        // matching that exact device_id + company_id + institution_id.
+        //
+        // IMPORTANT: the locally verified institution_id belongs to the Client
+        // Server database, while job.institution_id belongs to the Main Server
+        // database. They are different ID namespaces (for example client ID 1
+        // can map to Main Server ID 2). Institution codes are mutable and must
+        // not be compared on every SMS job either. Comparing either value here
+        // creates false INSTITUTION_MISMATCH failures for correctly routed jobs.
+        //
+        // Keep local verification as a prerequisite, but trust the authenticated
+        // Main Server device-token scope for each returned queue job. Never remove
+        // the device-token, company, institution or device_id checks on the server.
+        if (verifiedInstitutionId.isBlank() || verifiedInstitutionCode.isBlank()) {
+            Log.e(TAG, "SMS job blocked: organization verification is missing")
+            rejectClaimedJob(
+                jobId, requestId, "ORGANIZATION_NOT_VERIFIED",
+                "SMS blocked: verify organization and registered mobile"
+            )
             return
         }
 
@@ -514,6 +704,7 @@ class GatewayService : Service() {
             Log.e(TAG, "Duplicate in-flight SMS job ignored: $jobId")
             requestInProgress = false
             updateStatus("Duplicate SMS job ignored — check server")
+            scheduleImmediatePoll()
             return
         }
 
@@ -548,6 +739,28 @@ class GatewayService : Service() {
         }
     }
 
+    /** Report a claimed job that was rejected before Android SMS submission. */
+    private fun rejectClaimedJob(
+        jobId: Long,
+        requestId: String,
+        errorCode: String,
+        userMessage: String
+    ) {
+        requestInProgress = false
+        updateStatus(userMessage)
+
+        if (jobId > 0L && requestId.matches(Regex("^[a-f0-9]{32}$"))) {
+            reportResult(
+                jobId = jobId,
+                requestId = requestId,
+                success = false,
+                errorCode = errorCode
+            )
+        } else {
+            Log.e(TAG, "Cannot report rejected job: invalid job ID or request ID")
+        }
+    }
+
     /**
      * Report the final result to device_result.php.
      */
@@ -557,23 +770,60 @@ class GatewayService : Service() {
         success: Boolean,
         errorCode: String? = null
     ) {
-        if (!serviceRunning) {
+        if (jobId <= 0L || requestId.isBlank()) {
+            Log.e(TAG, "Cannot save invalid SMS result")
             requestInProgress = false
             return
         }
 
-        if (resultReporting) {
-            Log.w(TAG, "A result report is already in progress")
-            return
-        }
-
-        resultReporting = true
-
-        ApiClient.submitGatewayResult(
+        val pending = PendingGatewayResult(
             jobId = jobId,
             requestId = requestId,
             success = success,
             errorCode = errorCode
+        )
+
+        synchronized(pendingResultLock) {
+            val existing = loadPendingResult()
+
+            if (existing != null &&
+                (existing.jobId != jobId || existing.requestId != requestId)
+            ) {
+                Log.e(
+                    TAG,
+                    "A different SMS result is still pending; refusing to overwrite it"
+                )
+                requestInProgress = false
+                return
+            }
+
+            savePendingResult(pending)
+        }
+
+        if (serviceRunning) {
+            sendPendingResult()
+        } else {
+            Log.w(TAG, "SMS result saved locally; service is not running")
+            requestInProgress = false
+        }
+    }
+
+    /**
+     * Submit the locally persisted result. Keep it until the server confirms it.
+     */
+    private fun sendPendingResult() {
+        if (!serviceRunning || resultReporting) return
+
+        val pending = loadPendingResult() ?: return
+
+        resultReporting = true
+        requestInProgress = true
+
+        ApiClient.submitGatewayResult(
+            jobId = pending.jobId,
+            requestId = pending.requestId,
+            success = pending.success,
+            errorCode = pending.errorCode
         ) { result ->
 
             resultReporting = false
@@ -585,53 +835,130 @@ class GatewayService : Service() {
 
             result.fold(
                 onSuccess = { response ->
-
                     if (!response.optBoolean("ok", false)) {
                         Log.e(
                             TAG,
-                            "Server returned an unsuccessful result response"
+                            "Server rejected result for job ${pending.jobId}; keeping it for retry"
                         )
-
                         requestInProgress = false
-                        updateStatus("Result report rejected — check server")
+                        updateStatus("Result report rejected — retrying")
+                        scheduleRetryPoll()
                         return@fold
                     }
 
-                    Log.i(
-                        TAG,
-                        "Server accepted result for job $jobId"
-                    )
-
-                    requestInProgress = false
-
-                    if (success) {
-                        updateStatus(
-                            "SMS sent callback successful — waiting for next job"
-                        )
-                    } else {
-                        updateStatus(
-                            "SMS failed — waiting for next job"
-                        )
+                    synchronized(pendingResultLock) {
+                        val current = loadPendingResult()
+                        if (
+                            current?.jobId == pending.jobId &&
+                            current.requestId == pending.requestId
+                        ) {
+                            clearPendingResult()
+                        }
                     }
+
+                    Log.i(TAG, "Server accepted result for job ${pending.jobId}")
+                    requestInProgress = false
+                    scheduleImmediatePoll()
+
+                    updateStatus(
+                        if (pending.success) {
+                            "SMS result accepted — waiting for next job"
+                        } else {
+                            "SMS failure reported — waiting for next job"
+                        }
+                    )
                 },
 
                 onFailure = { exception ->
-
                     Log.e(
                         TAG,
-                        "Could not report result for job $jobId (${exception.javaClass.simpleName})"
+                        "Could not report result for job ${pending.jobId} " +
+                            "(${exception.javaClass.simpleName})"
                     )
-
+                    // Keep the pending result. pollServer() retries it.
                     requestInProgress = false
-                    updateStatus("Result report failed — check server")
+                    updateStatus("Result report failed — retrying")
+                    scheduleRetryPoll()
                 }
             )
         }
     }
 
+    /** Schedule the next queue check promptly after a completed job. */
+    private fun scheduleImmediatePoll() {
+        if (!serviceRunning) return
+        handler.removeCallbacks(pollRunnable)
+        handler.postDelayed(pollRunnable, IMMEDIATE_POLL_DELAY_MS)
+    }
+
+    /** Back off briefly on network/API failures; never spin a tight retry loop. */
+    private fun scheduleRetryPoll() {
+        if (!serviceRunning) return
+        handler.removeCallbacks(pollRunnable)
+        handler.postDelayed(pollRunnable, RETRY_POLL_DELAY_MS)
+    }
+
+    private fun savePendingResult(result: PendingGatewayResult) {
+        val json = JSONObject().apply {
+            put("job_id", result.jobId)
+            put("request_id", result.requestId)
+            put("success", result.success)
+            put("error_code", result.errorCode ?: JSONObject.NULL)
+        }
+
+        getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .edit()
+            .putString(PREF_PENDING_RESULT, json.toString())
+            .apply()
+    }
+
+    private fun loadPendingResult(): PendingGatewayResult? {
+        val raw = getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .getString(PREF_PENDING_RESULT, null)
+            ?: return null
+
+        return try {
+            val json = JSONObject(raw)
+            val jobId = json.optLong("job_id", 0L)
+            val requestId = json.optString("request_id", "").trim()
+
+            if (jobId <= 0L || requestId.isBlank()) {
+                Log.e(TAG, "Stored pending SMS result is invalid")
+                null
+            } else {
+                val errorCode = if (json.isNull("error_code")) {
+                    null
+                } else {
+                    json.optString("error_code")
+                }
+
+                PendingGatewayResult(
+                    jobId = jobId,
+                    requestId = requestId,
+                    success = json.optBoolean("success", false),
+                    errorCode = errorCode
+                )
+            }
+        } catch (exception: Exception) {
+            Log.e(TAG, "Could not read pending SMS result", exception)
+            null
+        }
+    }
+
+    private fun clearPendingResult() {
+        getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .edit()
+            .remove(PREF_PENDING_RESULT)
+            .apply()
+    }
+
     /**
      * Save whether the Android foreground gateway service is running.
      */
+    private fun isGatewayEnabled(): Boolean =
+        getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .getBoolean(PREF_GATEWAY_ENABLED, false)
+
     private fun saveServiceRunning(running: Boolean) {
         getSharedPreferences(
             statusPrefsName,
@@ -658,6 +985,15 @@ class GatewayService : Service() {
     }
 
     private fun updateStatus(message: String) {
+        // Persist the latest human-readable gateway detail so MainActivity can
+        // show the real reason (token rejected, network timeout, mapping issue,
+        // missing permissions, etc.) instead of only a generic FAILED label.
+        getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+            .edit()
+            .putString(PREF_LAST_STATUS_MESSAGE, message.take(240))
+            .putLong(PREF_LAST_STATUS_AT, System.currentTimeMillis())
+            .apply()
+
         if (!serviceRunning) return
 
         try {
@@ -678,6 +1014,7 @@ class GatewayService : Service() {
         resultReporting = false
 
         handler.removeCallbacks(pollRunnable)
+        releaseGatewayWakeLock()
 
         saveServiceRunning(false)
         setServerState(STATE_STOPPED)
@@ -691,6 +1028,43 @@ class GatewayService : Service() {
 
         stopSelf()
         Log.i(TAG, "Gateway service stopped")
+    }
+
+    /**
+     * A foreground service alone does not guarantee the CPU stays awake while
+     * the screen is off. Hold a partial wake lock only while the user-enabled
+     * gateway is active so its long-poll loop can continue in screen-off use.
+     */
+    private fun acquireGatewayWakeLock() {
+        try {
+            val existing = gatewayWakeLock
+            if (existing?.isHeld == true) return
+
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            gatewayWakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "$packageName:SmsGatewayPolling"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.i(TAG, "Gateway partial wake lock acquired")
+        } catch (exception: Exception) {
+            Log.e(TAG, "Could not acquire gateway wake lock", exception)
+            updateStatus("Gateway is running, but Android could pause polling while the screen is off")
+        }
+    }
+
+    private fun releaseGatewayWakeLock() {
+        try {
+            gatewayWakeLock?.let { lock ->
+                if (lock.isHeld) lock.release()
+            }
+        } catch (exception: Exception) {
+            Log.w(TAG, "Could not release gateway wake lock", exception)
+        } finally {
+            gatewayWakeLock = null
+        }
     }
 
     private fun createNotificationChannel() {
@@ -751,14 +1125,24 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
 
+        val shouldResume = isGatewayEnabled()
+
         serviceRunning = false
         requestInProgress = false
         resultReporting = false
 
         handler.removeCallbacks(pollRunnable)
+        releaseGatewayWakeLock()
 
+        // onDestroy can be called because Android is reclaiming the process.
+        // Do not erase the user's enabled preference in that case; START_STICKY
+        // can then recreate the service. Explicit Stop clears the preference first.
         saveServiceRunning(false)
-        setServerState(STATE_STOPPED)
+        if (shouldResume) {
+            setServerState(STATE_CONNECTING)
+        } else {
+            setServerState(STATE_STOPPED)
+        }
         smsJobs.clear()
 
         if (receiverRegistered) {
@@ -787,11 +1171,18 @@ class GatewayService : Service() {
         private const val CHANNEL_ID = "sms_gateway_service"
         private const val NOTIFICATION_ID = 1001
 
-        private const val POLL_INTERVAL_MS = 5000L
+        private const val IMMEDIATE_POLL_DELAY_MS = 150L
+        private const val POLL_WATCHDOG_INTERVAL_MS = 5000L
+        private const val POLL_REQUEST_STALE_MS = 45000L
+        private const val RETRY_POLL_DELAY_MS = 3000L
 
         private const val PREF_SERVICE_RUNNING = "service_running"
+        private const val PREF_GATEWAY_ENABLED = "gateway_enabled_by_user"
         private const val PREF_SERVER_STATE = "server_state"
         private const val PREF_SERVER_CHECK_AT = "server_check_at"
+        private const val PREF_LAST_STATUS_MESSAGE = "last_status_message"
+        private const val PREF_LAST_STATUS_AT = "last_status_at"
+        private const val PREF_PENDING_RESULT = "pending_gateway_result"
 
         private const val STATE_CONNECTED = "CONNECTED"
         private const val STATE_FAILED = "FAILED"
