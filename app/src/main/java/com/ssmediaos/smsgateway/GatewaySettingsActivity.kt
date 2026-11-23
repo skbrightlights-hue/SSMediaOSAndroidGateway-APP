@@ -3,6 +3,9 @@ package com.ssmediaos.smsgateway
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.text.Editable
+import android.text.TextWatcher
 import android.os.Build
 import android.os.Bundle
 import android.telephony.SubscriptionInfo
@@ -73,6 +76,53 @@ class GatewaySettingsActivity : Activity() {
         verifyMobileButton = findViewById(R.id.verifyMobileButton)
         connectionStatusText = findViewById(R.id.connectionStatusText)
         activationStatusText = findViewById(R.id.activationStatusText)
+
+        // Keep status-card colors synchronized with the real verification state.
+        organizationStatusText.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                val value = s?.toString().orEmpty().uppercase()
+                val verified = value.contains("VERIFIED") && !value.contains("NOT VERIFIED")
+                val rejected = value.contains("REJECTED")
+                val bg = when {
+                    verified -> 0xFFE6F6F3.toInt()
+                    rejected -> 0xFFFEECEC.toInt()
+                    else -> 0xFFFFF7E8.toInt()
+                }
+                val fg = when {
+                    verified -> 0xFF087F5B.toInt()
+                    rejected -> 0xFFB42318.toInt()
+                    else -> 0xFF9A5B00.toInt()
+                }
+                organizationStatusText.backgroundTintList = ColorStateList.valueOf(bg)
+                organizationStatusText.setTextColor(fg)
+            }
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+
+        activationStatusText.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                val value = s?.toString().orEmpty().uppercase()
+                val activated = value.contains("ACTIVATED") && !value.contains("NOT ACTIVATED") &&
+                    !value.contains("INCOMPLETE")
+                val inProgress = value.contains("PROGRESS")
+                val bg = when {
+                    activated -> 0xFFE6F6F3.toInt()
+                    inProgress -> 0xFFEAF2FF.toInt()
+                    else -> 0xFFFFF7E8.toInt()
+                }
+                val fg = when {
+                    activated -> 0xFF087F5B.toInt()
+                    inProgress -> 0xFF2457A6.toInt()
+                    else -> 0xFF9A5B00.toInt()
+                }
+                activationStatusText.backgroundTintList = ColorStateList.valueOf(bg)
+                activationStatusText.setTextColor(fg)
+            }
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+
         saveSettingsButton = findViewById(R.id.saveSettingsButton)
         testConnectionButton = findViewById(R.id.testConnectionButton)
         activateDeviceButton = findViewById(R.id.activateDeviceButton)
@@ -134,7 +184,7 @@ class GatewaySettingsActivity : Activity() {
         organizationCodeInput.setText(prefs.getString("organization_code", "").orEmpty())
         registeredMobileInput.setText(prefs.getString("registered_mobile", "").orEmpty())
         organizationNameText.text = prefs.getString("organization_name", null)
-            ?.takeIf { it.isNotBlank() } ?: "Organization Name: Not verified"
+            ?.takeIf { it.isNotBlank() } ?: "Not verified"
         organizationStatusText.text = prefs.getString("organization_status", null)
             ?.takeIf { it.isNotBlank() } ?: "Organization Verification: PENDING"
 
@@ -214,7 +264,7 @@ class GatewaySettingsActivity : Activity() {
                     .remove("organization_name")
                     .putBoolean("organization_verified", false)
                 SecureConfig.clearDeviceToken(this)
-                organizationNameText.text = "Organization Name: Not verified"
+                organizationNameText.text = "Not verified"
                 organizationStatusText.text = "Organization Verification: PENDING"
             }
             editor.apply()
@@ -360,7 +410,7 @@ class GatewaySettingsActivity : Activity() {
         }
 
         verifyMobileButton.isEnabled = false
-        organizationNameText.text = "Organization Name: Verifying..."
+        organizationNameText.text = "Verifying institution..."
         organizationStatusText.text = "Organization Verification: CHECKING"
         activationStatusText.text = "Device status: NOT ACTIVATED"
         connectionStatusText.text =
@@ -381,7 +431,7 @@ class GatewaySettingsActivity : Activity() {
                     if (!verified || clientId.isBlank() || institutionName.isBlank()) {
                         SecureConfig.clearOrganizationVerification(this)
                         SecureConfig.clearDeviceToken(this)
-                        organizationNameText.text = "Organization Name: Not verified"
+                        organizationNameText.text = "Not verified"
                         organizationStatusText.text = "Organization Verification: REJECTED"
                         connectionStatusText.text =
                             "Main Server response did not contain a complete verified Client institution identity."
@@ -392,7 +442,7 @@ class GatewaySettingsActivity : Activity() {
                             .putString("organization_name", institutionName)
                             .apply()
 
-                        organizationNameText.text = "Organization Name: $institutionName"
+                        organizationNameText.text = institutionName
                         organizationStatusText.text =
                             "Organization Verification: VERIFIED\n" +
                             "Client Institution ID: $clientId\n" +
@@ -410,7 +460,7 @@ class GatewaySettingsActivity : Activity() {
                         .remove("organization_name")
                         .apply()
 
-                    organizationNameText.text = "Organization Name: Not verified"
+                    organizationNameText.text = "Not verified"
                     organizationStatusText.text = "Organization Verification: REJECTED"
                     connectionStatusText.text =
                         error.message ?: "Main Server could not verify this institution."
@@ -512,8 +562,8 @@ class GatewaySettingsActivity : Activity() {
         val clientInstitutionId = SecureConfig.getClientInstitutionId(this)
         val mainInstitutionId = SecureConfig.getMainInstitutionId(this)
         organizationStatusText.text =
-            "Organization Verification: VERIFIED\\n" +
-            "Client Institution ID: ${clientInstitutionId.ifBlank { "Not returned" }}\\n" +
+            "Organization Verification: VERIFIED\n" +
+            "Client Institution ID: ${clientInstitutionId.ifBlank { "Not returned" }}\n" +
             "Main Server Institution ID: ${mainInstitutionId.ifBlank { "Pending activation" }}"
 
         val prefs = getSharedPreferences(
