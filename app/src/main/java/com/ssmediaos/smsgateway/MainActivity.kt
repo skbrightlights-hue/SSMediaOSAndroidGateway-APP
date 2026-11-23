@@ -677,27 +677,8 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * SMS report calls share ApiClient's non-poll executor with SMS result and
-     * delivery callbacks. Do not run dashboard/report queries while the gateway
-     * is active or starting; a slow report request could otherwise delay the
-     * result callbacks and stall the next queued SMS job.
-     */
-    private fun isGatewayActiveOrStarting(): Boolean {
-        val prefs = getSharedPreferences(SERVER_STATUS_PREFS, MODE_PRIVATE)
-        return gatewayStartRequested || prefs.getBoolean(PREF_SERVICE_RUNNING, false)
-    }
-
     private fun refreshSmsStats() {
         if (!::sentCountText.isInitialized) return
-
-        if (isGatewayActiveOrStarting()) {
-            sentCountText.text = "—"
-            failedCountText.text = "—"
-            deliveredCountText.text = "—"
-            pendingCountText.text = "Live SMS reporting is paused while the Gateway is running. Open Reports after stopping the Gateway."
-            return
-        }
 
         if (smsStatsRequestInFlight) return
 
@@ -846,15 +827,6 @@ class MainActivity : Activity() {
                 page,
                 "Institution: $institutionName\nOnly SMS records belonging to this verified institution are shown. Other institutions are excluded."
             )
-
-            if (isGatewayActiveOrStarting()) {
-                addPageMessage(
-                    page,
-                    "To protect live SMS sending, reports are paused while the Gateway is running. Stop the Gateway before opening this report.",
-                    Color.rgb(146, 64, 14)
-                )
-                return@showPage
-            }
 
             val loading = textView("Loading institution SMS report…", 13f, textMuted, false)
             page.addView(loading)
@@ -1061,14 +1033,6 @@ class MainActivity : Activity() {
             }
             page.addView(filters, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
             addPageMessage(page, "Period: ${period.uppercase()} • Main Server totals for this verified Gateway device. Delivered means a confirmed delivery receipt, not merely Android send success.")
-            if (isGatewayActiveOrStarting()) {
-                addPageMessage(
-                    page,
-                    "To protect live SMS sending, reports are paused while the Gateway is running. Stop the Gateway before opening this report.",
-                    Color.rgb(146, 64, 14)
-                )
-                return@showPage
-            }
             val loading = textView("Loading report…", 13f, textMuted, false)
             page.addView(loading)
             if (!SecureConfig.isOrganizationVerified(this)) {
