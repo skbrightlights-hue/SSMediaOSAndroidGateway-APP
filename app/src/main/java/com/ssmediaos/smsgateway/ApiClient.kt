@@ -1,5 +1,7 @@
 package com.ssmediaos.smsgateway
 
+import android.content.Context
+import android.util.Log
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -9,10 +11,15 @@ import java.util.concurrent.Executors
 
 object ApiClient {
 
+    // Keep long-poll requests isolated so a 15-second queue wait cannot block
+    // activation, result callbacks, or other Main Server API operations.
     private val executor = Executors.newSingleThreadExecutor()
+    private val pollExecutor = Executors.newSingleThreadExecutor()
 
     private const val CONNECT_TIMEOUT = 15000
-    private const val READ_TIMEOUT = 15000
+    // Main Server currently long-polls for up to 15 seconds. Keep a generous
+    // read timeout for shared-hosting latency without allowing an endless call.
+    private const val READ_TIMEOUT = 45000
 
     private const val DEFAULT_SERVER_URL =
         "https://otp.ssmediaos.in"
@@ -26,19 +33,311 @@ object ApiClient {
     private const val DEVICE_RESULT_PATH =
         "/api/v1/sms/device_result.php"
 
+    /*
+     * This endpoint must be implemented on the Main Server.
+     * It must perform the actual server-side diagnostic checks.
+     */
+    private const val GATEWAY_DIAGNOSTICS_PATH =
+        "/api/v1/sms/gateway_diagnostics.php"
+
+    /**
+     * Verify the complete gateway connection through Main Server.
+     *
+     * Main Server is responsible for:
+     * 1. Company API authentication.
+     * 2. Client API configuration lookup.
+     * 3. Client Server API connectivity.
+     * 4. Client Database connectivity.
+     * 5. Institution code and company relationship verification.
+     * 6. Registered mobile verification, when required by the
+     *    configured institution registration rules.
+     *
+     * The Android app must not connect directly to Client Database.
+     *
+     * Expected response:
+     *
+     * {
+     *   "ok": true,
+     *   "checks": {
+     *     "main_server": {
+     *       "status": "PASS",
+     *       "code": "MAIN_SERVER_CONNECTED",
+     *       "message": "Main Server connected"
+     *     },
+     *     "company_auth": {
+     *       "status": "PASS",
+     *       "code": "API_KEY_VALID",
+     *       "message": "API key verified"
+     *     },
+     *     "client_api_config": {
+     *       "status": "PASS",
+     *       "code": "CLIENT_API_CONFIGURED",
+     *       "message": "Client API configuration found"
+     *     },
+     *     "client_api": {
+     *       "status": "PASS",
+     *       "code": "CLIENT_API_CONNECTED",
+     *       "message": "Client API connected"
+     *     },
+     *     "client_database": {
+     *       "status": "PASS",
+     *       "code": "CLIENT_DATABASE_CONNECTED",
+     *       "message": "Client database connected"
+     *     },
+     *     "institution": {
+     *       "status": "PASS",
+     *       "code": "INSTITUTION_CODE_VERIFIED",
+     *       "message": "Institution verified"
+     *     }
+     *   }
+     * }
+     *
+     * The checks object above documents the response contract.
+     * The server must return real results, not fabricated PASS values.
+     */
+    fun diagnoseGateway(
+        companyApiKey: String,
+        institutionCode: String,
+        registeredMobileNumber: String,
+        callback: (Result<JSONObject>) -> Unit
+    ) {
+        executor.execute {
+            val result = runCatching {
+                val context = AppContextHolder.context
+
+                val apiKey = companyApiKey.trim()
+                val code = institutionCode.trim()
+                val mobile = registeredMobileNumber.trim()
+
+                if (apiKey.isBlank()) {
+                    throw IOException(
+                        "COMPANY_API_KEY_REQUIRED: Enter the Company API Key."
+                    )
+                }
+
+                if (code.isBlank()) {
+                    throw IOException(
+                        "INSTITUTION_CODE_REQUIRED: Enter the Institution Code."
+                    )
+                }
+
+                if (mobile.isBlank()) {
+                    throw IOException(
+                        "REGISTERED_MOBILE_REQUIRED: Enter the mobile number registered with the institution."
+                    )
+                }
+
+                if (
+                    mobile.any { !it.isDigit() && it != '+' && it != '-' && it != ' ' && it != '(' && it != ')' } ||
+                    normalizeMobile(mobile).length !in 8..15
+                ) {
+                    throw IOException(
+                        "INVALID_REGISTERED_MOBILE: Check the registered mobile number."
+                    )
+                }
+
+                /*
+                 * Diagnostics are read/verify-only. Do not rotate or clear
+                 * an already active gateway token just because an operator
+                 * checks the same institution again. SecureConfig clears
+                 * activation when the API key or institution identity changes.
+                 */
+                val deviceCode = SecureConfig
+                    .getDeviceCode(context)
+                    .trim()
+
+                val body = JSONObject()
+                    .put("companyApiKey", apiKey)
+                    .put("institutionCode", code)
+                    .put("organizationCode", code)
+                    .put("registeredMobileNumber", mobile)
+                    .put("deviceCode", deviceCode)
+
+                val response = request(
+                    endpoint = buildEndpoint(
+                        getServerUrl(context),
+                        GATEWAY_DIAGNOSTICS_PATH
+                    ),
+                    method = "POST",
+                    bearerToken = apiKey,
+                    body = body,
+                    allowHttpErrors = true
+                )
+
+                val httpStatus = response.optInt("_httpStatus", 200)
+                val topLevelSuccess = response.optBoolean(
+                    "success",
+                    response.optBoolean("ok", false)
+                )
+                if (httpStatus !in 200..299 || !topLevelSuccess) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        buildServerError(response, httpStatus, "GATEWAY_DIAGNOSTICS_FAILED")
+                    )
+                }
+
+                // Expected Main Server response:
+                // { "success": true, "data": {
+                //   "company_id": 1, "company_name": "...",
+                //   "institution_id": 1, "institution_name": "...",
+                //   "institution_code": "...", "registered_mobile_number": "...",
+                //   "mobile_updated": true, "verification_status": "VERIFIED"
+                // }}
+                val data = response.optJSONObject("data")
+                    ?: throw IOException(
+                        "DIAGNOSTIC_DATA_MISSING: Main Server did not return the data object."
+                    )
+
+                // If detailed diagnostic checks are included by an older server,
+                // continue enforcing them. The compact success/data contract above
+                // does not require a checks object.
+                val checks = response.optJSONObject("checks")
+                    ?: data.optJSONObject("checks")
+                if (checks != null) {
+                    val requiredChecks = listOf(
+                        "main_server", "company_auth", "client_api_config",
+                        "client_api", "client_database", "institution"
+                    )
+                    val failedChecks = requiredChecks.filter { name ->
+                        checks.optJSONObject(name)?.optString("status", "UNKNOWN")
+                            ?.equals("PASS", ignoreCase = true) != true
+                    }
+                    if (failedChecks.isNotEmpty()) {
+                        SecureConfig.clearOrganizationVerification(context)
+                        throw IOException(
+                            "DIAGNOSTICS_INCOMPLETE: Required checks did not pass: ${failedChecks.joinToString(", ")}."
+                        )
+                    }
+                }
+
+                // The Main Server verification response may contain separate
+                // main_server and client_server objects. Their numeric IDs belong
+                // to different databases and MUST never be compared or swapped.
+                // Prefer explicit namespace fields; retain the flat legacy shape
+                // only as a compatibility fallback for older diagnostics APIs.
+                val mainServer = data.optJSONObject("main_server") ?: JSONObject()
+                val clientServer = data.optJSONObject("client_server") ?: JSONObject()
+
+                val companyId = firstNonBlank(
+                    mainServer.optString("company_id"),
+                    data.optString("main_company_id"),
+                    data.optString("company_id")
+                )
+                val companyName = firstNonBlank(
+                    mainServer.optString("company_name"),
+                    data.optString("company_name")
+                )
+
+                val clientInstitutionId = firstNonBlank(
+                    data.optString("client_institution_id"),
+                    data.optString("clientInstitutionId"),
+                    clientServer.optString("institution_id"),
+                    // Legacy flat contract: institution_id is the Client ID.
+                    data.optString("institution_id")
+                )
+                val mainInstitutionId = firstNonBlank(
+                    data.optString("main_institution_id"),
+                    data.optString("mainInstitutionId"),
+                    mainServer.optString("institution_id")
+                )
+                val organizationName = firstNonBlank(
+                    clientServer.optString("institution_name"),
+                    data.optString("client_institution_name"),
+                    data.optString("institution_name"),
+                    mainServer.optString("institution_name")
+                )
+                // The code entered in the app is the Main Server code. A mapped
+                // Client Server code may legitimately be different.
+                val returnedCode = firstNonBlank(
+                    mainServer.optString("institution_code"),
+                    data.optString("main_institution_code"),
+                    data.optString("institution_code")
+                ).uppercase()
+
+                val registeredMobile = normalizeMobile(
+                    firstNonBlank(
+                        clientServer.optString("registered_mobile_number"),
+                        data.optString("registered_mobile_number")
+                    )
+                )
+                val organizationStatus = firstNonBlank(
+                    clientServer.optString("status"),
+                    data.optString("client_status"),
+                    data.optString("verification_status"),
+                    "VERIFIED"
+                )
+
+                val serverVerified = topLevelSuccess &&
+                    (organizationStatus.equals("VERIFIED", ignoreCase = true) ||
+                     organizationStatus.equals("ACTIVE", ignoreCase = true))
+
+                if (!serverVerified) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "INSTITUTION_NOT_VERIFIED: Main Server did not return verification_status VERIFIED."
+                    )
+                }
+                if (companyId.isBlank() || companyName.isBlank()) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "COMPANY_DATA_INCOMPLETE: Main Server must return company_id and company_name."
+                    )
+                }
+                if (clientInstitutionId.toLongOrNull()?.let { it > 0L } != true || organizationName.isBlank()) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "CLIENT_INSTITUTION_DATA_INCOMPLETE: Main Server must return the verified Client Server institution ID and name."
+                    )
+                }
+                if (returnedCode.isBlank() || returnedCode != code.uppercase()) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "INSTITUTION_CODE_MISMATCH: Returned institution_code does not match the entered code."
+                    )
+                }
+                if (registeredMobile.length !in 8..15) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "REGISTERED_MOBILE_MISSING: Main Server must return the actual registered_mobile_number."
+                    )
+                }
+                if (normalizeMobile(mobile) != registeredMobile) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "REGISTERED_MOBILE_MISMATCH: Returned mobile number does not match the number submitted by the app."
+                    )
+                }
+
+                if (!SecureConfig.saveVerifiedOrganization(
+                    context = context,
+                    organizationId = clientInstitutionId,
+                    clientInstitutionId = clientInstitutionId,
+                    mainInstitutionId = mainInstitutionId,
+                    organizationName = organizationName,
+                    organizationCode = returnedCode,
+                    registeredMobile = registeredMobile,
+                    organizationStatus = organizationStatus,
+                    companyId = companyId,
+                    companyName = companyName
+                )) {
+                    SecureConfig.clearOrganizationVerification(context)
+                    throw IOException(
+                        "INSTITUTION_SAVE_FAILED: Verified Company and Institution details could not be saved."
+                    )
+                }
+
+                response
+            }
+
+            callbackSafely(callback, result)
+        }
+    }
+
     /**
      * Activate a registered Android gateway device.
      *
-     * IMPORTANT:
-     * - Device ID is read dynamically from SecureConfig.
-     * - Company API token is read from SecureConfig.
-     * - Activation secret must match the server configuration.
-     *
-     * Expected server response:
-     * {
-     *   "ok": true,
-     *   "deviceToken": "server-issued-token"
-     * }
+     * Activation is accepted only when Main Server confirms success
+     * and returns a valid device token.
      */
     fun activate(
         callback: (Result<JSONObject>) -> Unit
@@ -47,29 +346,63 @@ object ApiClient {
             val result = runCatching {
                 val context = AppContextHolder.context
 
-                val serverUrl = SecureConfig.getServerUrl(context)
-                    ?.trim()
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: DEFAULT_SERVER_URL
+                val serverUrl = getServerUrl(context)
 
-                val deviceCode = SecureConfig.getDeviceCode(context)
+                val deviceCode = SecureConfig
+                    .getDeviceCode(context)
+                    .trim()
+                    .takeIf { it.isNotEmpty() }
+                    ?: throw IOException(
+                        "DEVICE_CODE_REQUIRED: Device ID is unavailable."
+                    )
+
+                val companyApiKey = SecureConfig
+                    .getCompanyApiKey(context)
                     ?.trim()
                     ?.takeIf { it.isNotEmpty() }
                     ?: throw IOException(
-                        "Device ID is unavailable. Please check device configuration."
+                        "COMPANY_API_KEY_REQUIRED: Enter the Company API Key."
                     )
 
-                val companyApiKey =
-                    SecureConfig.getCompanyApiKey(context)
-                        ?.trim()
-                        ?.takeIf { it.isNotEmpty() }
-                        ?: throw IOException(
-                            "Please enter your Company API Token in settings."
-                        )
+                if (!SecureConfig.isOrganizationVerified(context)) {
+                    throw IOException(
+                        "INSTITUTION_NOT_VERIFIED: Verify the institution with Main Server before activation."
+                    )
+                }
+
+                val clientInstitutionId = SecureConfig
+                    .getClientInstitutionId(context)
+                    .trim()
+                    .toLongOrNull()
+                    ?.takeIf { it > 0L }
+                    ?: throw IOException(
+                        "CLIENT_INSTITUTION_ID_MISSING: Client Server verification did not save a valid client institution ID."
+                    )
+
+                val institutionCode = SecureConfig
+                    .getOrganizationCode(context)
+                    .trim()
+                    .takeIf { it.isNotEmpty() }
+                    ?: throw IOException(
+                        "INSTITUTION_CODE_MISSING: Main Server verification did not save the institution code."
+                    )
+
+                // Activation rotates the server-side token. Clear the old one
+                // before the request so a timeout can never leave Android
+                // polling with a token that Main Server may have invalidated.
+                SecureConfig.clearDeviceToken(context)
 
                 val body = JSONObject()
                     .put("deviceCode", deviceCode)
                     .put("companyApiKey", companyApiKey)
+                    // This is explicitly the Client Server ID. The Main Server
+                    // activation endpoint resolves its own institution_id from
+                    // the authenticated company + registered device row.
+                    .put("clientInstitutionId", clientInstitutionId)
+                    .put("client_institution_id", clientInstitutionId)
+                    .put("institutionCode", institutionCode)
+                    .put("institution_code", institutionCode)
+                    .put("organizationCode", institutionCode)
 
                 val response = request(
                     endpoint = buildEndpoint(
@@ -77,30 +410,73 @@ object ApiClient {
                         DEVICE_ACTIVATE_PATH
                     ),
                     method = "POST",
-                    body = body
+                    bearerToken = companyApiKey,
+                    body = body,
+                    allowHttpErrors = true
                 )
 
-                if (!response.optBoolean("ok", false)) {
-                    // Do not display arbitrary server diagnostics in the app UI.
+                val httpStatus = response.optInt("_httpStatus", 200)
+
+                if (
+                    httpStatus !in 200..299 ||
+                    !response.optBoolean("ok", false)
+                ) {
+                    SecureConfig.clearDeviceToken(context)
+
                     throw IOException(
-                        "Device activation was rejected. Check the Company API Key and server configuration."
+                        buildServerError(
+                            response,
+                            httpStatus,
+                            "DEVICE_ACTIVATION_REJECTED"
+                        )
                     )
                 }
 
-                val deviceToken = response.optString("deviceToken")
+                // The Client ID was sent only as clientInstitutionId. The ID
+                // returned by device_activate.php is the Main Server ID. Keep
+                // these namespaces separate. The Main Server-issued device token
+                // remains the authority for polling and result reporting.
+                val returnedInstitutionId = response.optLong("institutionId", 0L)
+                val returnedCompanyId = response.optLong("companyId", 0L)
+
+                val deviceToken = response
+                    .optString("deviceToken")
                     .trim()
 
                 if (deviceToken.isBlank()) {
+                    SecureConfig.clearDeviceToken(context)
+
                     throw IOException(
-                        "Server activation response did not contain a device token."
+                        "DEVICE_TOKEN_MISSING: Server did not return a device token."
+                    )
+                }
+                if (returnedInstitutionId <= 0L) {
+                    SecureConfig.clearDeviceToken(context)
+                    throw IOException(
+                        "MAIN_INSTITUTION_ID_MISSING: Main Server did not return its authoritative institution ID."
+                    )
+                }
+                if (!SecureConfig.saveMainInstitutionId(context, returnedInstitutionId.toString())) {
+                    SecureConfig.clearDeviceToken(context)
+                    throw IOException(
+                        "MAIN_INSTITUTION_ID_SAVE_FAILED: Could not save the Main Server institution ID."
                     )
                 }
 
                 if (!SecureConfig.saveDeviceToken(context, deviceToken)) {
+                    SecureConfig.clearDeviceToken(context)
+
                     throw IOException(
-                        "Activation succeeded, but the device token could not be saved."
+                        "DEVICE_TOKEN_SAVE_FAILED: Could not securely save the device token."
                     )
                 }
+
+                Log.i(
+                    "ApiClient",
+                    "Gateway activation succeeded: main_institution_id=$returnedInstitutionId, " +
+                        "client_institution_id=$clientInstitutionId, company_id=$returnedCompanyId, " +
+                        "device_code=$deviceCode"
+                )
 
                 response
             }
@@ -110,29 +486,47 @@ object ApiClient {
     }
 
     /**
-     * Poll the server for one queued SMS job.
+     * Poll Main Server for one queued SMS job.
      */
     fun pollGatewayJob(
         callback: (Result<JSONObject>) -> Unit
     ) {
-        executor.execute {
+        pollExecutor.execute {
             val result = runCatching {
                 val context = AppContextHolder.context
 
-                val serverUrl = getServerUrl(context)
-                val deviceToken = getDeviceToken(context)
+                val gatewayToken = getDeviceToken(context)
+                Log.i(
+                    "ApiClient",
+                    "Starting Main Server poll: endpoint=$DEVICE_POLL_PATH, " +
+                        "gateway_token_present=${gatewayToken.isNotBlank()}"
+                )
 
                 val response = request(
                     endpoint = buildEndpoint(
-                        serverUrl,
+                        getServerUrl(context),
                         DEVICE_POLL_PATH
                     ),
                     method = "POST",
-                    gatewayToken = deviceToken,
+                    // Send both headers. Some shared-hosting/FastCGI stacks
+                    // remove custom X-* headers but preserve Authorization.
+                    gatewayToken = gatewayToken,
+                    bearerToken = gatewayToken,
                     body = JSONObject()
                 )
 
-                ensureSuccess(response, "Gateway polling failed.")
+                Log.i(
+                    "ApiClient",
+                    "Gateway poll HTTP ${response.optInt("_httpStatus", 200)}; " +
+                        "ok=${response.optBoolean("ok", false)}; " +
+                        "diagnostic=${response.optString("diagnostic_code", response.optString("error_code", "none"))}; " +
+                        "poll_request_id=${response.optString("poll_request_id", "none")}"
+                )
+
+                ensureSuccess(
+                    response,
+                    "GATEWAY_POLL_FAILED: Could not retrieve the SMS queue."
+                )
 
                 response
             }
@@ -142,7 +536,7 @@ object ApiClient {
     }
 
     /**
-     * Submit the result of an SMS job.
+     * Report the Android SMS sending result to Main Server.
      */
     fun submitGatewayResult(
         jobId: Long,
@@ -155,37 +549,42 @@ object ApiClient {
         executor.execute {
             val result = runCatching {
                 if (jobId <= 0L) {
-                    throw IOException("Invalid SMS job ID.")
+                    throw IOException("INVALID_JOB_ID: Invalid SMS job ID.")
                 }
 
-                if (requestId.isBlank()) {
-                    throw IOException("Request ID is missing.")
+                if (!requestId.matches(Regex("^[a-fA-F0-9]{32}$"))) {
+                    throw IOException("INVALID_REQUEST_ID: Request ID must be a 32-character hexadecimal value.")
                 }
 
                 val context = AppContextHolder.context
-                val serverUrl = getServerUrl(context)
-                val deviceToken = getDeviceToken(context)
 
                 val body = JSONObject()
                     .put("job_id", jobId)
                     .put("request_id", requestId)
                     .put("success", success)
-                    .put("provider_message_id", providerMessageId ?: "")
-                    .put("error_code", errorCode ?: "")
+                    .put("provider_message_id", providerMessageId?.trim()?.take(150) ?: "")
+                    .put(
+                        "error_code",
+                        errorCode?.trim()?.replace(Regex("[^A-Za-z0-9_.-]"), "_")?.take(100) ?: ""
+                    )
+
+                val gatewayToken = getDeviceToken(context)
 
                 val response = request(
                     endpoint = buildEndpoint(
-                        serverUrl,
+                        getServerUrl(context),
                         DEVICE_RESULT_PATH
                     ),
                     method = "POST",
-                    gatewayToken = deviceToken,
+                    // Keep X-Gateway-Token and add Authorization fallback.
+                    gatewayToken = gatewayToken,
+                    bearerToken = gatewayToken,
                     body = body
                 )
 
                 ensureSuccess(
                     response,
-                    "Failed to submit SMS result."
+                    "SMS_RESULT_REPORT_FAILED: Could not report the SMS result."
                 )
 
                 response
@@ -204,11 +603,11 @@ object ApiClient {
     ) {
         executor.execute {
             val result = runCatching {
-                val context = AppContextHolder.context
-                val serverUrl = getServerUrl(context)
-
                 request(
-                    endpoint = buildEndpoint(serverUrl, endpoint),
+                    endpoint = buildEndpoint(
+                        getServerUrl(AppContextHolder.context),
+                        endpoint
+                    ),
                     method = "GET"
                 )
             }
@@ -226,14 +625,15 @@ object ApiClient {
     ) {
         executor.execute {
             val result = runCatching {
-                val context = AppContextHolder.context
-                val serverUrl = getServerUrl(context)
-                val deviceToken = getDeviceToken(context)
-
                 request(
-                    endpoint = buildEndpoint(serverUrl, endpoint),
+                    endpoint = buildEndpoint(
+                        getServerUrl(AppContextHolder.context),
+                        endpoint
+                    ),
                     method = "GET",
-                    bearerToken = deviceToken
+                    bearerToken = getDeviceToken(
+                        AppContextHolder.context
+                    )
                 )
             }
 
@@ -251,14 +651,15 @@ object ApiClient {
     ) {
         executor.execute {
             val result = runCatching {
-                val context = AppContextHolder.context
-                val serverUrl = getServerUrl(context)
-                val deviceToken = getDeviceToken(context)
-
                 request(
-                    endpoint = buildEndpoint(serverUrl, endpoint),
+                    endpoint = buildEndpoint(
+                        getServerUrl(AppContextHolder.context),
+                        endpoint
+                    ),
                     method = "POST",
-                    bearerToken = deviceToken,
+                    bearerToken = getDeviceToken(
+                        AppContextHolder.context
+                    ),
                     body = body
                 )
             }
@@ -268,7 +669,7 @@ object ApiClient {
     }
 
     /**
-     * Existing explicit-credentials GET method retained.
+     * Existing explicit-credentials GET method retained for compatibility.
      */
     fun get(
         endpoint: String,
@@ -290,21 +691,37 @@ object ApiClient {
         }
     }
 
-    private fun getServerUrl(context: android.content.Context): String {
-        return SecureConfig.getServerUrl(context)
+    private fun firstNonBlank(vararg values: String): String =
+        values.firstOrNull { it.isNotBlank() && !it.equals("null", true) }
             ?.trim()
-            ?.takeIf { it.isNotEmpty() }
+            .orEmpty()
+
+    private fun normalizeMobile(value: String): String {
+        val digits = value.filter { it.isDigit() }
+        return when {
+            digits.length == 14 && digits.startsWith("0091") -> digits.takeLast(10)
+            digits.length == 12 && digits.startsWith("91") -> digits.takeLast(10)
+            digits.length == 11 && digits.startsWith("0") -> digits.takeLast(10)
+            else -> digits
+        }
+    }
+
+    private fun getServerUrl(context: Context): String {
+        val configured = SecureConfig
+            .getServerUrl(context)
+            .trim()
+
+        return configured.takeIf { it.isNotBlank() }
             ?: DEFAULT_SERVER_URL
     }
 
-    private fun getDeviceToken(
-        context: android.content.Context
-    ): String {
-        return SecureConfig.getDeviceToken(context)
+    private fun getDeviceToken(context: Context): String {
+        return SecureConfig
+            .getDeviceToken(context)
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
             ?: throw IOException(
-                "Device is not activated. Please activate it first."
+                "DEVICE_NOT_ACTIVATED: Activate the device before polling."
             )
     }
 
@@ -312,14 +729,74 @@ object ApiClient {
         response: JSONObject,
         defaultMessage: String
     ) {
-        if (!response.optBoolean("ok", false)) {
-            // Server-provided error text may contain internal implementation details.
-            throw IOException(defaultMessage)
+        val httpStatus = response.optInt("_httpStatus", 200)
+
+        if (
+            httpStatus !in 200..299 ||
+            !response.optBoolean("ok", false)
+        ) {
+            throw IOException(
+                buildServerError(
+                    response,
+                    httpStatus,
+                    defaultMessage
+                )
+            )
+        }
+    }
+
+    /**
+     * Extract a safe, structured server error for the app UI.
+     * The API must never send secrets or database credentials here.
+     */
+    private fun buildServerError(
+        response: JSONObject,
+        httpStatus: Int,
+        fallbackCode: String
+    ): String {
+        // Main Server diagnostic endpoints use different but documented keys:
+        // some return `error` + `diagnostic_code` + `diagnostic_message`, while
+        // older endpoints return `code` + `message`. Preserve either contract.
+        val code = sequenceOf(
+            response.optString("diagnostic_code", ""),
+            response.optString("error_code", ""),
+            response.optString("code", ""),
+            response.optString("error", "")
+        ).map { it.trim() }.firstOrNull { it.isNotBlank() }
+            ?: fallbackCode
+
+        val message = sequenceOf(
+            response.optString("diagnostic_message", ""),
+            response.optString("message", ""),
+            response.optString("error_description", "")
+        ).map { it.trim() }.firstOrNull { it.isNotBlank() }
+            ?: "Request was rejected by the server."
+
+        val nextAction = response.optString("next_action", "")
+            .replace(Regex("[\\r\\n\\t]+"), " ")
+            .trim()
+            .take(180)
+
+        return buildString {
+            append(code)
+            append(": ")
+            append(message.take(260))
+            append(" (HTTP ")
+            append(httpStatus)
+            append(")")
+            if (nextAction.isNotBlank()) {
+                append(". Next: ")
+                append(nextAction)
+            }
         }
     }
 
     /**
      * Shared HTTPS request handler.
+     *
+     * allowHttpErrors=true returns the JSON body for non-2xx responses,
+     * allowing diagnostic and activation screens to display server codes.
+     * Normal API calls continue to fail on non-2xx responses.
      */
     private fun request(
         endpoint: String,
@@ -327,34 +804,43 @@ object ApiClient {
         bearerToken: String? = null,
         gatewayToken: String? = null,
         deviceId: String? = null,
-        body: JSONObject? = null
+        body: JSONObject? = null,
+        allowHttpErrors: Boolean = false
     ): JSONObject {
 
         val parsedUrl = try {
             URL(endpoint)
         } catch (e: Exception) {
-            throw IOException("Invalid API URL.", e)
+            throw IOException("INVALID_API_URL: API URL is invalid.", e)
         }
 
         if (!parsedUrl.protocol.equals("https", ignoreCase = true)) {
-            throw IOException("Secure connection required. Please try again.")
+            throw IOException(
+                "HTTPS_REQUIRED: A secure HTTPS connection is required."
+            )
         }
 
         if (parsedUrl.userInfo != null) {
-            throw IOException("Invalid server configuration.")
+            throw IOException(
+                "INVALID_SERVER_CONFIGURATION: URL credentials are not allowed."
+            )
         }
 
-        // This app is intended to communicate only with the configured SS MediaOS API.
-        // This also protects the explicit-credentials compatibility overload from
-        // accidentally sending tokens to a different HTTPS host.
         val expectedHost = URI(DEFAULT_SERVER_URL).host
-        if (!parsedUrl.host.equals(expectedHost, ignoreCase = true) ||
-            (parsedUrl.port != -1 && parsedUrl.port != 443)) {
-            throw IOException("Unrecognized server. Check the app configuration.")
+
+        if (
+            !parsedUrl.host.equals(expectedHost, ignoreCase = true) ||
+            (parsedUrl.port != -1 && parsedUrl.port != 443)
+        ) {
+            throw IOException(
+                "UNRECOGNIZED_SERVER: The configured API host is not allowed."
+            )
         }
 
         if (method != "GET" && method != "POST") {
-            throw IOException("Unsupported API request.")
+            throw IOException(
+                "UNSUPPORTED_HTTP_METHOD: API request method is not supported."
+            )
         }
 
         val connection = (
@@ -364,6 +850,7 @@ object ApiClient {
             connectTimeout = CONNECT_TIMEOUT
             readTimeout = READ_TIMEOUT
             instanceFollowRedirects = false
+            useCaches = false
 
             setRequestProperty("Accept", "application/json")
 
@@ -382,11 +869,15 @@ object ApiClient {
             }
 
             if (!deviceId.isNullOrBlank()) {
-                setRequestProperty("X-Device-ID", deviceId)
+                setRequestProperty(
+                    "X-Device-ID",
+                    deviceId
+                )
             }
 
             if (body != null) {
                 doOutput = true
+
                 setRequestProperty(
                     "Content-Type",
                     "application/json; charset=utf-8"
@@ -403,7 +894,14 @@ object ApiClient {
                     }
             }
 
-            val responseCode = connection.responseCode
+            val responseCode = try {
+                connection.responseCode
+            } catch (e: Exception) {
+                throw IOException(
+                    "API_CONNECTION_FAILED: Could not obtain the server response.",
+                    e
+                )
+            }
 
             val stream = if (responseCode in 200..299) {
                 connection.inputStream
@@ -416,32 +914,75 @@ object ApiClient {
                 ?.use { reader -> reader.readText() }
                 ?: ""
 
-            if (responseCode !in 200..299) {
-                // Keep server diagnostics out of user-visible errors.
-                throw IOException(
-                    "Server request failed (HTTP $responseCode). Please try again."
-                )
-            }
-
             if (responseBody.isBlank()) {
+                if (!allowHttpErrors && responseCode !in 200..299) {
+                    throw IOException(
+                        "HTTP_REQUEST_FAILED: Server returned HTTP $responseCode."
+                    )
+                }
+
                 return JSONObject()
+                    .put("_httpStatus", responseCode)
+                    .put(
+                        "ok",
+                        responseCode in 200..299
+                    )
+                    .put(
+                        "code",
+                        if (responseCode in 200..299) {
+                            "EMPTY_SERVER_RESPONSE"
+                        } else {
+                            "HTTP_$responseCode"
+                        }
+                    )
+                    .put(
+                        "message",
+                        if (responseCode in 200..299) {
+                            "Server returned an empty response."
+                        } else {
+                            "Server rejected the request."
+                        }
+                    )
             }
 
-            return try {
+            val response = try {
                 JSONObject(responseBody)
             } catch (e: Exception) {
                 throw IOException(
-                    "Server response is not a valid JSON object.",
+                    "INVALID_SERVER_RESPONSE: Server did not return valid JSON.",
                     e
                 )
             }
+
+            response.put("_httpStatus", responseCode)
+
+            if (!allowHttpErrors && responseCode !in 200..299) {
+                throw IOException(
+                    buildServerError(
+                        response,
+                        responseCode,
+                        "HTTP_REQUEST_FAILED"
+                    )
+                )
+            }
+
+            return response
+
+        } catch (e: IOException) {
+            throw e
+        } catch (e: Exception) {
+            throw IOException(
+                "API_CONNECTION_FAILED: The request could not be completed.",
+                e
+            )
         } finally {
             connection.disconnect()
         }
     }
 
     /**
-     * Build a safe endpoint from the configured HTTPS server URL.
+     * Build an endpoint from the configured HTTPS server URL.
+     * Only relative API paths are accepted.
      */
     private fun buildEndpoint(
         serverUrl: String,
@@ -455,30 +996,25 @@ object ApiClient {
 
         require(
             !path.startsWith("//") &&
-                !path.contains('\\') &&
-                !path.contains("\r") &&
-                !path.contains("\n")
-        ) {
-            "Invalid API endpoint."
-        }
-
-        require(
+            !path.contains('\\') &&
+            !path.contains("\r") &&
+            !path.contains("\n") &&
             !path.startsWith("https://", ignoreCase = true) &&
-                !path.startsWith("http://", ignoreCase = true)
+            !path.startsWith("http://", ignoreCase = true)
         ) {
-            "Provide a relative API path, not a full URL."
+            "Invalid API endpoint. Use a relative path."
         }
 
         val base = URI(serverUrl.trim().trimEnd('/'))
 
         require(
             base.scheme.equals("https", ignoreCase = true) &&
-                !base.host.isNullOrBlank() &&
-                base.userInfo == null &&
-                base.rawQuery == null &&
-                base.rawFragment == null
+            !base.host.isNullOrBlank() &&
+            base.userInfo == null &&
+            base.rawQuery == null &&
+            base.rawFragment == null
         ) {
-            "Invalid HTTPS server URL."
+            "Invalid HTTPS server configuration."
         }
 
         return "${base.toASCIIString()}/${path.trimStart('/')}"
@@ -491,8 +1027,7 @@ object ApiClient {
         try {
             callback(result)
         } catch (_: Exception) {
-            // Prevent callback exceptions from terminating the worker.
+            // A UI callback exception must not terminate the worker.
         }
     }
 }
-
