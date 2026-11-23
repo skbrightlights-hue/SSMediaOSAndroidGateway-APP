@@ -17,6 +17,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
@@ -58,6 +59,68 @@ class GatewayService : Service() {
         ConcurrentHashMap<Long, SmsJobState>()
 
     /**
+     * Receives package-scoped delivery events from SmsDeliveryReceiver.
+     * These events are deliberately kept separate from SMS_SENT callbacks:
+     * carrier delivery failure must never turn a successfully submitted SMS
+     * into a send failure or trigger a wallet refund.
+     */
+    private val smsDeliveryPartReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != SmsDeliveryReceiver.ACTION_SMS_DELIVERY_PART_RESULT) return
+
+            val jobId = intent.getLongExtra(SmsDeliveryReceiver.EXTRA_JOB_ID, -1L)
+            val requestId = intent.getStringExtra(
+                SmsDeliveryReceiver.EXTRA_GATEWAY_REQUEST_ID
+            ).orEmpty().trim()
+            val partIndex = intent.getIntExtra(SmsDeliveryReceiver.EXTRA_PART_INDEX, -1)
+            val totalParts = intent.getIntExtra(SmsDeliveryReceiver.EXTRA_TOTAL_PARTS, 1)
+            val delivered = intent.getBooleanExtra(SmsDeliveryReceiver.EXTRA_DELIVERED, false)
+            val allPartsDelivered = intent.getBooleanExtra(
+                SmsDeliveryReceiver.EXTRA_ALL_PARTS_DELIVERED, false
+            )
+            val deliveryError = intent.getStringExtra(
+                SmsDeliveryReceiver.EXTRA_DELIVERY_ERROR
+            ).orEmpty().replace(Regex("[^A-Za-z0-9_.-]"), "_").take(100)
+
+            if (jobId <= 0L || !requestId.matches(Regex("^[a-fA-F0-9]{32}$"))) {
+                Log.w(TAG, "Ignoring delivery event with invalid job/request identity")
+                return
+            }
+            if (totalParts !in 1..255 || partIndex !in 0 until totalParts) {
+                Log.w(TAG, "Ignoring delivery event with invalid part index")
+                return
+            }
+
+            // SmsDeliveryReceiver already validates every part and writes the
+            // local history. Persist an outbox event here for the next server
+            // integration step; never call device_result.php with success=false
+            // for a delivery-only failure because that endpoint refunds sends.
+            val eventStatus = when {
+                allPartsDelivered -> "DELIVERED"
+                !delivered -> "DELIVERY_FAILED"
+                else -> "DELIVERY_PART_RECEIVED"
+            }
+            enqueuePendingDeliveryEvent(
+                jobId = jobId,
+                requestId = requestId.lowercase(),
+                status = eventStatus,
+                partIndex = partIndex,
+                totalParts = totalParts,
+                errorCode = deliveryError
+            )
+
+            if (allPartsDelivered) {
+                updateStatus("SMS delivered — waiting for Main Server delivery sync")
+                Log.i(TAG, "All SMS parts delivered: job=$jobId request=$requestId")
+            } else if (!delivered) {
+                // SMS remains SENT. A delivery receipt error is not a send error.
+                updateStatus("SMS sent — delivery report failed or unavailable")
+                Log.w(TAG, "SMS delivery report failed: job=$jobId error=$deliveryError")
+            }
+        }
+    }
+
+    /**
      * Keep a claimed job's final result until the Main Server acknowledges it.
      */
     private data class PendingGatewayResult(
@@ -68,6 +131,7 @@ class GatewayService : Service() {
     )
 
     private val pendingResultLock = Any()
+    private val deliveryOutboxLock = Any()
 
     /**
      * Poll watchdog.
@@ -313,9 +377,10 @@ class GatewayService : Service() {
     private fun registerSmsResultReceiver() {
         if (receiverRegistered) return
 
-        val filter = IntentFilter(
-            SmsSentReceiver.ACTION_SMS_PART_RESULT
-        )
+        val filter = IntentFilter().apply {
+            addAction(SmsSentReceiver.ACTION_SMS_PART_RESULT)
+            addAction(SmsDeliveryReceiver.ACTION_SMS_DELIVERY_PART_RESULT)
+        }
 
         try {
             if (Build.VERSION.SDK_INT >= 33) {
@@ -324,9 +389,18 @@ class GatewayService : Service() {
                     filter,
                     Context.RECEIVER_NOT_EXPORTED
                 )
+                registerReceiver(
+                    smsDeliveryPartReceiver,
+                    IntentFilter(SmsDeliveryReceiver.ACTION_SMS_DELIVERY_PART_RESULT),
+                    Context.RECEIVER_NOT_EXPORTED
+                )
             } else {
                 @Suppress("DEPRECATION")
                 registerReceiver(smsResultReceiver, filter)
+                registerReceiver(
+                    smsDeliveryPartReceiver,
+                    IntentFilter(SmsDeliveryReceiver.ACTION_SMS_DELIVERY_PART_RESULT)
+                )
             }
 
             receiverRegistered = true
@@ -889,6 +963,61 @@ class GatewayService : Service() {
         }
     }
 
+    /**
+     * Durable, deduplicated local outbox for carrier delivery events.
+     * The server delivery endpoint is added in the following API file; keeping
+     * this outbox now prevents a delivery receipt being lost between callbacks.
+     */
+    private fun enqueuePendingDeliveryEvent(
+        jobId: Long,
+        requestId: String,
+        status: String,
+        partIndex: Int,
+        totalParts: Int,
+        errorCode: String
+    ) {
+        val prefs = getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+        synchronized(deliveryOutboxLock) {
+            val current = try {
+                JSONArray(prefs.getString(PREF_PENDING_DELIVERY_EVENTS, "[]") ?: "[]")
+            } catch (_: Exception) {
+                JSONArray()
+            }
+
+            val eventKey = if (status == "DELIVERED") {
+                "$jobId:$requestId:DELIVERED"
+            } else {
+                "$jobId:$requestId:$status:$partIndex"
+            }
+
+            for (index in 0 until current.length()) {
+                val existing = current.optJSONObject(index) ?: continue
+                if (existing.optString("event_key") == eventKey) return
+            }
+
+            val rebuilt = JSONArray()
+            val row = JSONObject().apply {
+                put("event_key", eventKey)
+                put("job_id", jobId)
+                put("request_id", requestId)
+                put("status", status)
+                put("part_index", partIndex)
+                put("total_parts", totalParts)
+                put("error_code", errorCode)
+                put("created_at_ms", System.currentTimeMillis())
+            }
+            rebuilt.put(row)
+
+            // Keep the most recent 500 events; never grow SharedPreferences forever.
+            val start = (current.length() - 499).coerceAtLeast(0)
+            for (index in start until current.length()) {
+                val existing = current.optJSONObject(index) ?: continue
+                rebuilt.put(existing)
+            }
+            prefs.edit().putString(PREF_PENDING_DELIVERY_EVENTS, rebuilt.toString()).apply()
+        }
+    }
+
     /** Schedule the next queue check promptly after a completed job. */
     private fun scheduleImmediatePoll() {
         if (!serviceRunning) return
@@ -1153,6 +1282,7 @@ class GatewayService : Service() {
         if (receiverRegistered) {
             try {
                 unregisterReceiver(smsResultReceiver)
+                unregisterReceiver(smsDeliveryPartReceiver)
             } catch (exception: IllegalArgumentException) {
                 Log.w(
                     TAG,
@@ -1188,6 +1318,7 @@ class GatewayService : Service() {
         private const val PREF_LAST_STATUS_MESSAGE = "last_status_message"
         private const val PREF_LAST_STATUS_AT = "last_status_at"
         private const val PREF_PENDING_RESULT = "pending_gateway_result"
+        private const val PREF_PENDING_DELIVERY_EVENTS = "pending_gateway_delivery_events"
 
         private const val STATE_CONNECTED = "CONNECTED"
         private const val STATE_FAILED = "FAILED"
