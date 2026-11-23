@@ -234,12 +234,12 @@ class MainActivity : Activity() {
 
         // Permission action card stays at the top of the dashboard.
         // Android displays its native permission dialog when the user taps Allow.
-        val permissionCard = LinearLayout(this).apply {
+        val permissionPromptCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(15), dp(16), dp(15))
             background = roundedBackground(Color.rgb(255, 247, 232), 16)
         }
-        permissionCard.addView(
+        permissionPromptCard.addView(
             textView("SMS PERMISSION REQUIRED", 13f, Color.rgb(146, 64, 14), true)
         )
         permissionActionMessage = textView(
@@ -250,7 +250,7 @@ class MainActivity : Activity() {
         ).apply {
             setPadding(0, dp(6), 0, dp(10))
         }
-        permissionCard.addView(permissionActionMessage)
+        permissionPromptCard.addView(permissionActionMessage)
 
         permissionActionButton = Button(this).apply {
             text = "Allow SMS Permission"
@@ -261,16 +261,16 @@ class MainActivity : Activity() {
             background = roundedBackground(Color.rgb(8, 127, 115), 10)
             setOnClickListener { requestRequiredPermissions() }
         }
-        permissionCard.addView(
+        permissionPromptCard.addView(
             permissionActionButton,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(48)
             )
         )
-        permissionActionCard = permissionCard
+        permissionActionCard = permissionPromptCard
         content.addView(
-            permissionCard,
+            permissionPromptCard,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
