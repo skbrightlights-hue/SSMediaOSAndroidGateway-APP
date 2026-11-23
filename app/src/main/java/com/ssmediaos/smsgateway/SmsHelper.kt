@@ -114,6 +114,7 @@ object SmsHelper {
             }
 
             val sentIntents = ArrayList<PendingIntent>(parts.size)
+            val deliveryIntents = ArrayList<PendingIntent>(parts.size)
 
             parts.forEachIndexed { index, _ ->
                 sentIntents.add(
@@ -125,7 +126,25 @@ object SmsHelper {
                         totalParts = parts.size
                     )
                 )
+                deliveryIntents.add(
+                    createDeliveryPendingIntent(
+                        context = appContext,
+                        jobId = jobId,
+                        requestId = normalizedRequestId,
+                        partIndex = index,
+                        totalParts = parts.size
+                    )
+                )
             }
+
+            // Keep a local state before handing the message to Android. The
+            // GatewayService will replace it with SENT/FAILED after callbacks.
+            SmsHistoryStore.record(
+                context = appContext,
+                jobId = jobId,
+                requestId = normalizedRequestId,
+                status = "SENDING"
+            )
 
             if (parts.size == 1) {
                 smsManager.sendTextMessage(
@@ -133,7 +152,7 @@ object SmsHelper {
                     null,
                     parts[0],
                     sentIntents[0],
-                    null
+                    deliveryIntents[0]
                 )
             } else {
                 smsManager.sendMultipartTextMessage(
@@ -141,7 +160,7 @@ object SmsHelper {
                     null,
                     ArrayList(parts),
                     sentIntents,
-                    null
+                    deliveryIntents
                 )
             }
 
@@ -169,6 +188,37 @@ object SmsHelper {
                 e.message ?: "Unable to submit SMS."
             )
         }
+    }
+
+    /**
+     * Delivery callbacks are separate from sent callbacks. Android may never
+     * deliver a report when the carrier/network does not provide one; absence
+     * of a callback must therefore remain SENT/PENDING, never be guessed as
+     * DELIVERED.
+     */
+    private fun createDeliveryPendingIntent(
+        context: Context,
+        jobId: Long,
+        requestId: String,
+        partIndex: Int,
+        totalParts: Int
+    ): PendingIntent {
+        val requestCode = requestCodeCounter.getAndIncrement()
+        val intent = Intent(context, SmsDeliveryReceiver::class.java).apply {
+            action = SmsDeliveryReceiver.ACTION_SMS_DELIVERY_RESULT
+            putExtra(SmsSentReceiver.EXTRA_REQUEST_CODE, requestCode)
+            putExtra(SmsSentReceiver.EXTRA_JOB_ID, jobId)
+            putExtra(SmsSentReceiver.EXTRA_GATEWAY_REQUEST_ID, requestId)
+            putExtra(SmsSentReceiver.EXTRA_PART_INDEX, partIndex)
+            putExtra(SmsSentReceiver.EXTRA_TOTAL_PARTS, totalParts)
+            data = Uri.parse("ssmediaos://sms-delivery/$requestCode")
+        }
+
+        var flags = PendingIntent.FLAG_UPDATE_CURRENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags = flags or PendingIntent.FLAG_IMMUTABLE
+        }
+        return PendingIntent.getBroadcast(context, requestCode, intent, flags)
     }
 
     private fun getSmsManager(
