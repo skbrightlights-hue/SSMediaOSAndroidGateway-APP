@@ -1,30 +1,15 @@
-
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Main Server / Client API communication -->
     <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- Background Gateway -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <!-- SMS Sending -->
     <uses-permission android:name="android.permission.SEND_SMS" />
-
-    <!-- SIM selection -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-
-    <!-- Restart Gateway after reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-    <!-- Android notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-    <!-- Foreground Service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- Optional Telephony hardware -->
     <uses-feature
         android:name="android.hardware.telephony"
         android:required="false" />
@@ -39,64 +24,44 @@
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- Main Dashboard -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
-
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
         </activity>
 
-        <!-- Gateway Settings -->
         <activity
             android:name=".GatewaySettingsActivity"
             android:label="Gateway Settings"
             android:exported="false" />
 
-        <!-- Background SMS Gateway Service -->
         <service
             android:name=".GatewayService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Boot Receiver -->
         <receiver
             android:name=".GatewayBootReceiver"
             android:enabled="true"
             android:exported="true">
-
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
-
         </receiver>
 
-        <!-- SMS Sent Result Receiver -->
         <receiver
             android:name=".SmsSentReceiver"
             android:enabled="true"
             android:exported="false" />
 
-        <!-- SMS Delivered Result Receiver -->
         <receiver
             android:name=".SmsDeliveryReceiver"
             android:enabled="true"
             android:exported="false" />
 
-        <!-- No Incoming SMS Receiver -->
-
     </application>
-
-    <!--
-        Privacy:
-        READ_SMS permission is intentionally not included.
-        RECEIVE_SMS permission is intentionally not included.
-        The application does not register an incoming SMS receiver.
-    -->
-
 </manifest>
