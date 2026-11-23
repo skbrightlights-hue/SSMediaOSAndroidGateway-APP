@@ -1,21 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Network access -->
+    <!-- Main Server / Client API communication (HTTPS only). -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Send SMS only; do not read incoming or personal SMS -->
+    <!-- Keeps the explicitly enabled foreground gateway polling while screen is off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The Gateway sends SMS jobs assigned to its verified organization. -->
     <uses-permission android:name="android.permission.SEND_SMS" />
 
-    <!-- Notifications on Android 13+ -->
+    <!-- Used only to inspect available SIM subscriptions for SIM selection.
+         This permission does not grant access to incoming SMS messages. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <!-- Allows the user-enabled Gateway to resume after a normal device reboot. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Android 13+ foreground-service notification. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Foreground service -->
+    <!-- Foreground Gateway service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- Required when targeting Android 14+ and using dataSync FGS type -->
-    <uses-permission
-        android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Telephony hardware is optional so devices without SIM support can install the app. -->
+    <uses-feature
+        android:name="android.hardware.telephony"
+        android:required="false" />
 
     <application
         android:name=".GatewayApplication"
@@ -27,36 +39,51 @@
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- Main Dashboard -->
+        <!-- Main Dashboard / Launcher. -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
-
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
         </activity>
 
-        <!-- Gateway Settings -->
+        <!-- Gateway Settings. -->
         <activity
             android:name=".GatewaySettingsActivity"
             android:label="Gateway Settings"
             android:exported="false" />
 
-        <!-- Gateway Foreground Service -->
+        <!-- Background SMS Gateway service. -->
         <service
             android:name=".GatewayService"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- SMS Sent Receiver -->
+        <!-- Restart only when the user had explicitly enabled the Gateway. -->
+        <receiver
+            android:name=".GatewayBootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Receives only this app's SMS-sent PendingIntent callbacks.
+             It does not receive or read incoming SMS messages. -->
         <receiver
             android:name=".SmsSentReceiver"
             android:exported="false" />
 
+        <!-- Intentionally no IncomingSmsReceiver. -->
     </application>
+
+    <!-- Intentionally omitted:
+         android.permission.READ_SMS
+         android.permission.RECEIVE_SMS
+         No incoming-SMS receiver is registered. -->
 
 </manifest>
