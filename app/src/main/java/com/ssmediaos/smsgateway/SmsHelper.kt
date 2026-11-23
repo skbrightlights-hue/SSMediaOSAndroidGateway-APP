@@ -10,13 +10,19 @@ import android.os.Build
 import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.util.Log
+import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicInteger
 
 object SmsHelper {
 
     private const val TAG = "SmsHelper"
 
-    private val requestCodeCounter = AtomicInteger(2000)
+    // Randomize the starting range on each process start so a reboot/process
+    // restart is very unlikely to reuse an outstanding PendingIntent identity.
+    // Atomic increments keep every multipart part unique within this process.
+    private val requestCodeCounter = AtomicInteger(
+        SecureRandom().nextInt(10_000, Int.MAX_VALUE - 10_000)
+    )
 
     sealed class SendResult {
         data object Success : SendResult()
