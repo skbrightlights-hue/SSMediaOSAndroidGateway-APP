@@ -108,6 +108,9 @@ class GatewayService : Service() {
                 totalParts = totalParts,
                 errorCode = deliveryError
             )
+            if (serviceRunning) {
+                sendPendingDeliveryEvent()
+            }
 
             if (allPartsDelivered) {
                 updateStatus("SMS delivered — waiting for Main Server delivery sync")
@@ -132,6 +135,9 @@ class GatewayService : Service() {
 
     private val pendingResultLock = Any()
     private val deliveryOutboxLock = Any()
+
+    @Volatile
+    private var deliveryReporting = false
 
     /**
      * Poll watchdog.
@@ -595,6 +601,11 @@ class GatewayService : Service() {
             return
         }
 
+        if (hasPendingDeliveryEvents()) {
+            sendPendingDeliveryEvent()
+            return
+        }
+
         requestInProgress = true
         pollStartedAtMs = System.currentTimeMillis()
         setServerState(STATE_CONNECTING)
@@ -998,6 +1009,7 @@ class GatewayService : Service() {
             val rebuilt = JSONArray()
             val row = JSONObject().apply {
                 put("event_key", eventKey)
+                put("event_id", java.util.UUID.randomUUID().toString())
                 put("job_id", jobId)
                 put("request_id", requestId)
                 put("status", status)
@@ -1015,6 +1027,156 @@ class GatewayService : Service() {
                 rebuilt.put(existing)
             }
             prefs.edit().putString(PREF_PENDING_DELIVERY_EVENTS, rebuilt.toString()).apply()
+        }
+    }
+
+
+    /**
+     * True when at least one carrier delivery receipt is waiting for Main Server.
+     */
+    private fun hasPendingDeliveryEvents(): Boolean {
+        val prefs = getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+        synchronized(deliveryOutboxLock) {
+            return try {
+                val rows = JSONArray(
+                    prefs.getString(PREF_PENDING_DELIVERY_EVENTS, "[]") ?: "[]"
+                )
+                rows.length() > 0
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Send the oldest durable delivery event. The row is removed only after
+     * device_delivery_result.php acknowledges it; network failures leave it
+     * in the local outbox for a later retry.
+     */
+    private fun sendPendingDeliveryEvent() {
+        if (!serviceRunning || deliveryReporting) return
+
+        val event = synchronized(deliveryOutboxLock) {
+            try {
+                val rows = JSONArray(
+                    getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                        .getString(PREF_PENDING_DELIVERY_EVENTS, "[]") ?: "[]"
+                )
+                if (rows.length() == 0) null else rows.optJSONObject(0)
+            } catch (exception: Exception) {
+                Log.e(TAG, "Could not read pending SMS delivery outbox", exception)
+                null
+            }
+        } ?: return
+
+        val eventId = event.optString("event_id", "").trim()
+        val eventKey = event.optString("event_key", "").trim()
+        val jobId = event.optLong("job_id", 0L)
+        val requestId = event.optString("request_id", "").trim().lowercase()
+        val storedStatus = event.optString("status", "").trim().uppercase()
+        val partIndex = event.optInt("part_index", -1)
+        val totalParts = event.optInt("total_parts", 0)
+        val errorCode = event.optString("error_code", "").trim()
+
+        val apiStatus = when (storedStatus) {
+            "DELIVERED" -> "delivered"
+            "DELIVERY_FAILED" -> "delivery_failed"
+            "DELIVERY_PART_RECEIVED" -> "delivery_part_received"
+            else -> {
+                Log.e(TAG, "Unknown pending delivery status: $storedStatus")
+                return
+            }
+        }
+
+        if (
+            eventId.isBlank() ||
+            eventKey.isBlank() ||
+            jobId <= 0L ||
+            !requestId.matches(Regex("^[a-f0-9]{32}$")) ||
+            totalParts !in 1..255 ||
+            partIndex !in 0 until totalParts
+        ) {
+            Log.e(TAG, "Invalid pending delivery event; keeping it for inspection")
+            updateStatus("Delivery sync waiting — invalid local receipt")
+            return
+        }
+
+        deliveryReporting = true
+        ApiClient.submitGatewayDeliveryResult(
+            eventId = eventId,
+            jobId = jobId,
+            requestId = requestId,
+            status = apiStatus,
+            partIndex = partIndex,
+            totalParts = totalParts,
+            errorCode = errorCode
+        ) { result ->
+            deliveryReporting = false
+
+            if (!serviceRunning) return@submitGatewayDeliveryResult
+
+            result.fold(
+                onSuccess = { response ->
+                    if (!response.optBoolean("ok", false)) {
+                        Log.w(
+                            TAG,
+                            "Main Server did not accept delivery event $eventId; retaining outbox row"
+                        )
+                        updateStatus("Delivery sync pending — retrying Main Server")
+                        scheduleRetryPoll()
+                        return@fold
+                    }
+
+                    synchronized(deliveryOutboxLock) {
+                        val prefs = getSharedPreferences(statusPrefsName, MODE_PRIVATE)
+                        val current = try {
+                            JSONArray(
+                                prefs.getString(PREF_PENDING_DELIVERY_EVENTS, "[]") ?: "[]"
+                            )
+                        } catch (_: Exception) {
+                            JSONArray()
+                        }
+                        val remaining = JSONArray()
+                        for (index in 0 until current.length()) {
+                            val row = current.optJSONObject(index) ?: continue
+                            if (row.optString("event_key") != eventKey) {
+                                remaining.put(row)
+                            }
+                        }
+                        prefs.edit()
+                            .putString(PREF_PENDING_DELIVERY_EVENTS, remaining.toString())
+                            .apply()
+                    }
+
+                    Log.i(
+                        TAG,
+                        "Main Server accepted delivery receipt: job=$jobId status=$apiStatus"
+                    )
+                    updateStatus(
+                        when (apiStatus) {
+                            "delivered" -> "SMS delivered — Main Server updated"
+                            "delivery_failed" -> "SMS sent — delivery failure reported"
+                            else -> "SMS sent — delivery part reported"
+                        }
+                    )
+
+                    // Drain the next queued receipt without waiting for another SMS poll.
+                    handler.post {
+                        if (serviceRunning && hasPendingDeliveryEvents()) {
+                            sendPendingDeliveryEvent()
+                        }
+                    }
+                },
+                onFailure = { exception ->
+                    Log.w(
+                        TAG,
+                        "Delivery receipt upload failed; keeping it for retry: " +
+                            (exception.message ?: exception.javaClass.simpleName)
+                    )
+                    updateStatus("Delivery sync failed — retrying")
+                    scheduleRetryPoll()
+                }
+            )
         }
     }
 
@@ -1146,6 +1308,7 @@ class GatewayService : Service() {
         serviceRunning = false
         requestInProgress = false
         resultReporting = false
+        deliveryReporting = false
 
         handler.removeCallbacks(pollRunnable)
         releaseGatewayWakeLock()
@@ -1264,6 +1427,7 @@ class GatewayService : Service() {
         serviceRunning = false
         requestInProgress = false
         resultReporting = false
+        deliveryReporting = false
 
         handler.removeCallbacks(pollRunnable)
         releaseGatewayWakeLock()
