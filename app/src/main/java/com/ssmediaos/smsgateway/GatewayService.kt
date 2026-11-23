@@ -382,10 +382,10 @@ class GatewayService : Service() {
 
         // A gateway must be bound to exactly one verified institution.
         // Do not start polling if the authoritative institution identity is incomplete.
-        val verifiedInstitutionId = SecureConfig.getOrganizationId(this).trim()
+        val verifiedClientInstitutionId = SecureConfig.getClientInstitutionId(this).trim()
         val verifiedInstitutionName = SecureConfig.getOrganizationName(this).trim()
         val verifiedInstitutionCode = SecureConfig.getOrganizationCode(this).trim()
-        if (verifiedInstitutionId.isBlank() || verifiedInstitutionName.isBlank() || verifiedInstitutionCode.isBlank()) {
+        if (verifiedClientInstitutionId.isBlank() || verifiedInstitutionName.isBlank() || verifiedInstitutionCode.isBlank()) {
             Log.w(TAG, "Gateway start blocked: verified institution identity is incomplete")
             saveServiceRunning(false)
             setServerState(STATE_FAILED)
@@ -683,7 +683,12 @@ class GatewayService : Service() {
         // Keep local verification as a prerequisite, but trust the authenticated
         // Main Server device-token scope for each returned queue job. Never remove
         // the device-token, company, institution or device_id checks on the server.
-        if (verifiedInstitutionId.isBlank() || verifiedInstitutionCode.isBlank()) {
+        // This is the Client Server ID. Do not compare it with job.institution_id,
+        // which belongs to the Main Server database and is validated by the
+        // authenticated device-token scope on Main Server.
+        val clientInstitutionId = SecureConfig.getClientInstitutionId(this).trim()
+        val clientInstitutionCode = SecureConfig.getOrganizationCode(this).trim()
+        if (clientInstitutionId.isBlank() || clientInstitutionCode.isBlank()) {
             Log.e(TAG, "SMS job blocked: organization verification is missing")
             rejectClaimedJob(
                 jobId, requestId, "ORGANIZATION_NOT_VERIFIED",
