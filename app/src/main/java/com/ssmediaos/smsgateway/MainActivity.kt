@@ -26,6 +26,9 @@ class MainActivity : Activity() {
     private lateinit var serverText: TextView
     private lateinit var permissionText: TextView
     private lateinit var gatewayText: TextView
+    private var permissionActionCard: LinearLayout? = null
+    private var permissionActionButton: Button? = null
+    private var permissionActionMessage: TextView? = null
     private lateinit var content: LinearLayout
     private lateinit var dashboardScroll: ScrollView
     private lateinit var rootFrame: FrameLayout
@@ -229,6 +232,53 @@ class MainActivity : Activity() {
             }
         )
 
+        // Permission action card stays at the top of the dashboard.
+        // Android displays its native permission dialog when the user taps Allow.
+        val permissionCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(15), dp(16), dp(15))
+            background = roundedBackground(Color.rgb(255, 247, 232), 16)
+        }
+        permissionCard.addView(
+            textView("SMS PERMISSION REQUIRED", 13f, Color.rgb(146, 64, 14), true)
+        )
+        permissionActionMessage = textView(
+            "Allow SMS and SIM permissions to enable outgoing SMS and selected-SIM routing.",
+            12f,
+            Color.rgb(120, 75, 35),
+            false
+        ).apply {
+            setPadding(0, dp(6), 0, dp(10))
+        }
+        permissionCard.addView(permissionActionMessage)
+
+        permissionActionButton = Button(this).apply {
+            text = "Allow SMS Permission"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setTypeface(typeface, Typeface.BOLD)
+            background = roundedBackground(Color.rgb(8, 127, 115), 10)
+            setOnClickListener { requestRequiredPermissions() }
+        }
+        permissionCard.addView(
+            permissionActionButton,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(48)
+            )
+        )
+        permissionActionCard = permissionCard
+        content.addView(
+            permissionCard,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(18)
+            }
+        )
+
         // Dashboard
         content.addView(
             sectionTitle(
@@ -280,53 +330,28 @@ class MainActivity : Activity() {
             }
         )
 
-        // Compact SMS overview: show only the three operational outcomes requested.
-        content.addView(sectionTitle("SMS Activity", "Main Server verified totals • Today"))
+        // SMS activity summary. Counts are recorded from Android send callbacks.
+        content.addView(sectionTitle("SMS Activity", "Live counters recorded on this device"))
 
         val smsStatsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
-        val sentCard = createDashboardStatusCard(
-            "SMS SENT", "0", "Sent successfully", Color.rgb(22, 163, 74),
-            Color.rgb(236, 253, 245)
-        )
-        val failedCard = createDashboardStatusCard(
-            "SMS FAILED", "0", "Send failed", Color.rgb(220, 38, 38),
-            Color.rgb(254, 242, 242)
-        )
-        val receivedCard = createDashboardStatusCard(
-            "SMS DELIVERED", "—", "Receipt confirmed", Color.rgb(37, 99, 235),
-            Color.rgb(239, 246, 255)
-        )
+        val sentCard = createStatCard("SMS SENT", "0", "Submitted by device", green)
+        val failedCard = createStatCard("SMS FAILED", "0", "Send errors", Color.rgb(220, 53, 69))
+        val receivedCard = createStatCard("SMS DELIVERED", "—", "Confirmed delivery receipts", green)
         sentCountText = sentCard.getChildAt(1) as TextView
         failedCountText = failedCard.getChildAt(1) as TextView
         deliveredCountText = receivedCard.getChildAt(1) as TextView
-
-        smsStatsRow.addView(
-            sentCard,
-            LinearLayout.LayoutParams(0, dp(116), 1f).apply { marginEnd = dp(5) }
-        )
-        smsStatsRow.addView(
-            failedCard,
-            LinearLayout.LayoutParams(0, dp(116), 1f).apply { marginStart = dp(5); marginEnd = dp(5) }
-        )
-        smsStatsRow.addView(
-            receivedCard,
-            LinearLayout.LayoutParams(0, dp(116), 1f).apply { marginStart = dp(5) }
-        )
-        content.addView(
-            smsStatsRow,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(18) }
-        )
-
-        // Keep the field for existing refresh/error handling, but do not show
-        // queue/pending counters on the clean three-status dashboard.
-        pendingCountText = textView("", 1f, textMuted, false).apply {
-            visibility = View.GONE
-        }
+        smsStatsRow.addView(sentCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginEnd = dp(5) })
+        smsStatsRow.addView(failedCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginStart = dp(5); marginEnd = dp(5) })
+        smsStatsRow.addView(receivedCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginStart = dp(5) })
+        content.addView(smsStatsRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(8) })
+        pendingCountText = textView(
+            "Pending: —   •   Delivery is counted only after a confirmed delivery receipt",
+            11f, textMuted, false
+        ).apply { setPadding(dp(4), 0, dp(4), dp(14)) }
         content.addView(pendingCountText)
 
         val permissionCard = createStatCard(
@@ -622,7 +647,7 @@ class MainActivity : Activity() {
                     sentCountText.text = summary.optInt("sent", summary.optInt("submitted", 0)).toString()
                     failedCountText.text = summary.optInt("failed", 0).toString()
                     deliveredCountText.text = summary.optInt("delivered", 0).toString()
-                    pendingCountText.text = ""
+                    pendingCountText.text = "Queued: ${summary.optInt("queued", 0)}   •   Pending: ${summary.optInt("pending", 0)}   •   Period: Today"
                 }.onFailure { error ->
                     setDashboardUnavailable(error.message ?: "Could not load Main Server SMS totals.")
                 }
@@ -634,7 +659,7 @@ class MainActivity : Activity() {
         sentCountText.text = "—"
         failedCountText.text = "—"
         deliveredCountText.text = "—"
-        pendingCountText.text = ""
+        pendingCountText.text = "Main Server report unavailable: ${reason.take(180)}"
     }
 
     private fun showDashboard() {
@@ -859,53 +884,6 @@ Android Permissions & Platform Policy
 Review the final target SDK, manifest and service implementation before release; requirements can change between Android versions.
     """.trimIndent()
 
-    /**
-     * Color-tinted dashboard card for the three SMS outcomes.
-     * Child order remains label, value, description so existing counter
-     * bindings continue to target child index 1.
-     */
-    private fun createDashboardStatusCard(
-        label: String,
-        value: String,
-        description: String,
-        accent: Int,
-        tint: Int
-    ): LinearLayout {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(11), dp(12), dp(9), dp(12))
-            background = roundedBackground(tint, 16)
-            elevation = dp(2).toFloat()
-        }
-
-        card.addView(
-            textView(label, 10f, textDark, true).apply {
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-            }
-        )
-
-        card.addView(
-            textView(value, 23f, accent, true).apply {
-                tag = "value_$label"
-                setPadding(0, dp(8), 0, dp(3))
-                maxLines = 1
-                includeFontPadding = false
-            }
-        )
-
-        card.addView(
-            textView(description, 10f, textMuted, false).apply {
-                maxLines = 2
-                ellipsize = android.text.TextUtils.TruncateAt.END
-            }
-        )
-
-        card.contentDescription = "$label: $value. $description"
-        return card
-    }
-
     private fun createStatCard(
         label: String,
         value: String,
@@ -1096,7 +1074,7 @@ Review the final target SDK, manifest and service implementation before release;
             if (sendGranted && phoneGranted) {
                 showToast("Required SMS and SIM permissions granted.")
             } else {
-                showToast("Gateway needs both SMS and SIM permissions. You can grant them in Android App Settings.")
+                showToast("Permission not granted. Tap Allow Required Permissions at the top of the dashboard to try again.")
             }
         }
     }
@@ -1329,6 +1307,27 @@ Review the final target SDK, manifest and service implementation before release;
         } else {
             "Required permission missing"
         }
+
+        val notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val allRequiredGranted = smsGranted && phoneStateGranted && notificationGranted
+        permissionActionCard?.visibility = if (allRequiredGranted) View.GONE else View.VISIBLE
+        permissionActionMessage?.text = when {
+            !smsGranted && !phoneStateGranted ->
+                "Allow SMS and SIM permissions to send outgoing messages using the selected SIM."
+            !smsGranted ->
+                "SMS permission is needed to send authorized outgoing messages."
+            !phoneStateGranted ->
+                "Phone/SIM permission is needed to identify and use the selected SIM."
+            else ->
+                "Allow notifications so the gateway can show its foreground service status."
+        }
+        permissionActionButton?.text = if (allRequiredGranted) {
+            "Permissions Granted"
+        } else {
+            "Allow Required Permissions"
+        }
+        permissionActionButton?.isEnabled = !allRequiredGranted
 
         statusText.text = buildString {
             appendLine("App Status: Running")
