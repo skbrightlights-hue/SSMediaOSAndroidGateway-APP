@@ -33,6 +33,12 @@ object ApiClient {
     private const val DEVICE_RESULT_PATH =
         "/api/v1/sms/device_result.php"
 
+    // Separate endpoint for carrier delivery receipts. Do not reuse
+    // device_result.php: that endpoint finalizes SEND success/failure and may
+    // trigger a wallet refund when success=false.
+    private const val DEVICE_DELIVERY_RESULT_PATH =
+        "/api/v1/sms/device_delivery_result.php"
+
     /*
      * This endpoint must be implemented on the Main Server.
      * It must perform the actual server-side diagnostic checks.
@@ -587,6 +593,94 @@ object ApiClient {
                     "SMS_RESULT_REPORT_FAILED: Could not report the SMS result."
                 )
 
+                response
+            }
+
+            callbackSafely(callback, result)
+        }
+    }
+
+    /**
+     * Report a carrier delivery receipt to Main Server.
+     *
+     * This is intentionally separate from submitGatewayResult(): a carrier
+     * delivery failure does NOT mean Android failed to submit the SMS and
+     * must never enter device_result.php or trigger a send-charge refund.
+     *
+     * Main Server endpoint contract:
+     * POST /api/v1/sms/device_delivery_result.php
+     * Headers: X-Gateway-Token and Authorization: Bearer <same token>
+     * JSON: event_id, job_id, request_id, status, part_index, total_parts,
+     *       error_code
+     *
+     * Accepted statuses: delivery_part_received, delivered, delivery_failed.
+     * The endpoint must validate active device + company + institution + job
+     * ownership, and process event_id idempotently.
+     */
+    fun submitGatewayDeliveryResult(
+        eventId: String,
+        jobId: Long,
+        requestId: String,
+        status: String,
+        partIndex: Int,
+        totalParts: Int,
+        errorCode: String? = null,
+        callback: (Result<JSONObject>) -> Unit
+    ) {
+        executor.execute {
+            val result = runCatching {
+                if (eventId.isBlank() || eventId.length > 180) {
+                    throw IOException("INVALID_DELIVERY_EVENT_ID: Invalid delivery event identity.")
+                }
+                if (jobId <= 0L) {
+                    throw IOException("INVALID_JOB_ID: Invalid SMS job ID.")
+                }
+                if (!requestId.matches(Regex("^[a-fA-F0-9]{32}$"))) {
+                    throw IOException("INVALID_REQUEST_ID: Request ID must be a 32-character hexadecimal value.")
+                }
+
+                val normalizedStatus = status.trim().lowercase()
+                if (normalizedStatus !in setOf(
+                        "delivery_part_received", "delivered", "delivery_failed"
+                    )
+                ) {
+                    throw IOException("INVALID_DELIVERY_STATUS: Unsupported delivery status.")
+                }
+                if (totalParts !in 1..255 || partIndex !in 0 until totalParts) {
+                    throw IOException("INVALID_DELIVERY_PART: Invalid multipart delivery part.")
+                }
+
+                val context = AppContextHolder.context
+                val body = JSONObject()
+                    .put("event_id", eventId.trim())
+                    .put("job_id", jobId)
+                    .put("request_id", requestId.trim().lowercase())
+                    .put("status", normalizedStatus)
+                    .put("part_index", partIndex)
+                    .put("total_parts", totalParts)
+                    .put(
+                        "error_code",
+                        errorCode?.trim()
+                            ?.replace(Regex("[^A-Za-z0-9_.-]"), "_")
+                            ?.take(100) ?: ""
+                    )
+
+                val gatewayToken = getDeviceToken(context)
+                val response = request(
+                    endpoint = buildEndpoint(
+                        getServerUrl(context),
+                        DEVICE_DELIVERY_RESULT_PATH
+                    ),
+                    method = "POST",
+                    gatewayToken = gatewayToken,
+                    bearerToken = gatewayToken,
+                    body = body
+                )
+
+                ensureSuccess(
+                    response,
+                    "SMS_DELIVERY_REPORT_FAILED: Could not report the SMS delivery receipt."
+                )
                 response
             }
 
