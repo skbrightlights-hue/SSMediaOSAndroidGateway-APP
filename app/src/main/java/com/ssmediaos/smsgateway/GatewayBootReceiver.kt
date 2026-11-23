@@ -8,54 +8,53 @@ import android.util.Log
 
 /**
  * Restarts the Gateway after a normal device reboot only when the user had
- * previously enabled it. It does not attempt to bypass Android Force Stop.
- *
- * Required manifest entries are provided separately in the next integration
- * step: RECEIVE_BOOT_COMPLETED permission and an exported receiver with
- * BOOT_COMPLETED / LOCKED_BOOT_COMPLETED intent actions.
+ * previously enabled it. Android Force Stop cannot be bypassed by an app.
  */
 class GatewayBootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
-        val action = intent?.action ?: return
-        if (action != Intent.ACTION_BOOT_COMPLETED &&
-            action != Intent.ACTION_LOCKED_BOOT_COMPLETED) {
+        val receivedAction = intent?.action ?: return
+        if (receivedAction != Intent.ACTION_BOOT_COMPLETED &&
+            receivedAction != Intent.ACTION_LOCKED_BOOT_COMPLETED
+        ) {
             return
         }
 
-        // Must match GatewayService.statusPrefsName and preference key.
-        // SharedPreferences are device-protected only after unlock in this app;
-        // therefore start on BOOT_COMPLETED, not before user unlock.
-        if (action == Intent.ACTION_LOCKED_BOOT_COMPLETED) return
+        // This app stores the preference in credential-protected storage, so
+        // wait until BOOT_COMPLETED (after the user unlocks the device).
+        if (receivedAction == Intent.ACTION_LOCKED_BOOT_COMPLETED) return
 
         val enabled = context
-            .getSharedPreferences("ss_mediaos_gateway_status", Context.MODE_PRIVATE)
-            .getBoolean("gateway_enabled_by_user", false)
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(PREF_GATEWAY_ENABLED, false)
 
         if (!enabled) {
             Log.i(TAG, "Gateway was not enabled by user; skipping boot restart")
             return
         }
 
-        val serviceIntent = Intent(context, GatewayService::class.java).apply {
-            action = GatewayService.ACTION_START
-        }
+        // Use setAction() rather than an apply { action = ... } block. The latter
+        // can resolve `action` to the outer immutable local variable and cause
+        // Kotlin's: 'val' cannot be reassigned.
+        val serviceIntent = Intent(context, GatewayService::class.java)
+            .setAction(GatewayService.ACTION_START)
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent)
             } else {
+                @Suppress("DEPRECATION")
                 context.startService(serviceIntent)
             }
             Log.i(TAG, "Requested Gateway restart after device boot")
-        } catch (e: Exception) {
-            // Android/OEM restrictions can still prevent a boot-time start.
-            Log.e(TAG, "Could not restart Gateway after boot", e)
+        } catch (exception: Exception) {
+            Log.e(TAG, "Could not restart Gateway after boot", exception)
         }
     }
 
     companion object {
         private const val TAG = "GatewayBootReceiver"
+        private const val PREFS_NAME = "ss_mediaos_gateway_status"
+        private const val PREF_GATEWAY_ENABLED = "gateway_enabled_by_user"
     }
 }
-
