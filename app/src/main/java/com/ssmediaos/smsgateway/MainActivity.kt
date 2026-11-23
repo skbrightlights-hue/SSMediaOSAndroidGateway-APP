@@ -331,7 +331,17 @@ class MainActivity : Activity() {
         )
 
         // SMS activity summary. Counts are recorded from Android send callbacks.
-        content.addView(sectionTitle("SMS Activity", "Live counters recorded on this device"))
+        val dashboardInstitutionName = if (SecureConfig.isOrganizationVerified(this)) {
+            SecureConfig.getOrganizationName(this).ifBlank { "Verified institution" }
+        } else {
+            "Institution not verified"
+        }
+        content.addView(
+            sectionTitle(
+                "SMS Activity",
+                "$dashboardInstitutionName • Today's SMS totals"
+            )
+        )
 
         val smsStatsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -342,9 +352,9 @@ class MainActivity : Activity() {
         sentCountText = sentCard.getChildAt(1) as TextView
         failedCountText = failedCard.getChildAt(1) as TextView
         deliveredCountText = receivedCard.getChildAt(1) as TextView
-        smsStatsRow.addView(sentCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginEnd = dp(5) })
-        smsStatsRow.addView(failedCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginStart = dp(5); marginEnd = dp(5) })
-        smsStatsRow.addView(receivedCard, LinearLayout.LayoutParams(0, dp(112), 1f).apply { marginStart = dp(5) })
+        smsStatsRow.addView(sentCard, LinearLayout.LayoutParams(0, dp(132), 1f).apply { marginEnd = dp(5) })
+        smsStatsRow.addView(failedCard, LinearLayout.LayoutParams(0, dp(132), 1f).apply { marginStart = dp(5); marginEnd = dp(5) })
+        smsStatsRow.addView(receivedCard, LinearLayout.LayoutParams(0, dp(132), 1f).apply { marginStart = dp(5) })
         content.addView(smsStatsRow, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { bottomMargin = dp(8) })
@@ -367,7 +377,43 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(112)
             ).apply {
-                bottomMargin = dp(22)
+                bottomMargin = dp(18)
+            }
+        )
+
+        // Visible shortcut: open the verified institution's SMS delivery report
+        // directly from the Dashboard (not only from the navigation drawer).
+        val reportShortcutCard = createCard().apply {
+            addView(textView("INSTITUTION SMS REPORT", 13f, navy, true))
+            addView(
+                textView(
+                    "View only the SMS activity for the institution verified on this device. " +
+                        "Sent and Delivered are shown as separate results.",
+                    12f,
+                    textMuted,
+                    false
+                ).apply {
+                    setPadding(0, dp(7), 0, dp(12))
+                    setLineSpacing(dp(2).toFloat(), 1f)
+                }
+            )
+            addView(
+                actionButton("Open SMS Delivery Report", blue) {
+                    showSmsLogsPage()
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(50)
+                )
+            )
+        }
+        content.addView(
+            reportShortcutCard,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(20)
             }
         )
 
@@ -551,7 +597,7 @@ class MainActivity : Activity() {
 
         addDrawerItem("OVERVIEW", "▰", { showDashboard() })
         addDrawerItem("Dashboard", "⌂", { showDashboard() })
-        addDrawerItem("SMS Logs", "▤", { showSmsLogsPage() })
+        addDrawerItem("Institution SMS Report", "▤", { showSmsLogsPage() })
         addDrawerItem("Reports & Analytics", "▥", { showReportsPage("today") })
         addDrawerItem("GATEWAY", "▣", { openGatewaySettings() })
         addDrawerItem("Gateway Settings", "⚙", { openGatewaySettings() })
@@ -632,24 +678,93 @@ class MainActivity : Activity() {
 
     private fun refreshSmsStats() {
         if (!::sentCountText.isInitialized) return
+
+        if (!SecureConfig.isOrganizationVerified(this)) {
+            sentCountText.text = "—"
+            failedCountText.text = "—"
+            deliveredCountText.text = "—"
+            pendingCountText.text = "Verify institution to view its SMS totals."
+            return
+        }
+
+        val institutionId = SecureConfig.getClientInstitutionId(this)
+        val institutionCode = SecureConfig.getOrganizationCode(this)
+        if (institutionId.isBlank() || institutionCode.isBlank()) {
+            sentCountText.text = "—"
+            failedCountText.text = "—"
+            deliveredCountText.text = "—"
+            pendingCountText.text = "Verified institution identity is incomplete. Re-verify institution."
+            return
+        }
+
         sentCountText.text = "…"
         failedCountText.text = "…"
         deliveredCountText.text = "…"
-        pendingCountText.text = "Loading Main Server SMS totals…"
-        ApiClient.getConfigured("/api/v1/sms/device_reports.php?view=summary&period=today") { result ->
+        pendingCountText.text = "Loading verified institution SMS totals…"
+
+        val reportPath = "/api/v1/sms/device_reports.php?view=summary&period=today" +
+            "&client_institution_id=${android.net.Uri.encode(institutionId)}" +
+            "&institution_code=${android.net.Uri.encode(institutionCode)}"
+
+        ApiClient.getConfigured(reportPath) { result ->
             runOnUiThread {
                 result.onSuccess { response ->
                     if (!response.optBoolean("ok", false)) {
-                        setDashboardUnavailable(response.optString("message", "SMS report API did not return a valid response."))
+                        setDashboardUnavailable(
+                            response.optString("message", "SMS report API did not return a valid response.")
+                        )
                         return@onSuccess
                     }
+
+                    val responseInstitutionId = response.optString(
+                        "client_institution_id",
+                        response.optString("institution_id", "")
+                    )
+                    val responseInstitutionCode = response.optString(
+                        "institution_code",
+                        response.optString("organization_code", "")
+                    )
+
+                    // Do not display a summary unless the API confirms the same
+                    // verified institution requested by this Android device.
+                    val scopeMatches =
+                        responseInstitutionId == institutionId ||
+                        (responseInstitutionCode.isNotBlank() &&
+                            responseInstitutionCode.equals(institutionCode, ignoreCase = true))
+
+                    if (!scopeMatches) {
+                        setDashboardUnavailable(
+                            "Main Server did not confirm this verified institution's identity in the report response."
+                        )
+                        return@onSuccess
+                    }
+
                     val summary = response.optJSONObject("summary") ?: response
-                    sentCountText.text = summary.optInt("sent", summary.optInt("submitted", 0)).toString()
-                    failedCountText.text = summary.optInt("failed", 0).toString()
-                    deliveredCountText.text = summary.optInt("delivered", 0).toString()
-                    pendingCountText.text = "Queued: ${summary.optInt("queued", 0)}   •   Pending: ${summary.optInt("pending", 0)}   •   Period: Today"
+                    val sent = summary.optInt(
+                        "sent",
+                        summary.optInt("submitted", summary.optInt("total_sent", 0))
+                    )
+                    val failed = summary.optInt(
+                        "failed",
+                        summary.optInt("total_failed", 0)
+                    )
+                    val delivered = summary.optInt(
+                        "delivered",
+                        summary.optInt("total_delivered", 0)
+                    )
+                    val queued = summary.optInt("queued", summary.optInt("total_queued", 0))
+                    val pending = summary.optInt("pending", summary.optInt("total_pending", 0))
+
+                    sentCountText.text = sent.toString()
+                    failedCountText.text = failed.toString()
+                    deliveredCountText.text = delivered.toString()
+                    pendingCountText.text =
+                        "Institution: ${SecureConfig.getOrganizationName(this)}  •  " +
+                        "Queued: $queued  •  Pending: $pending  •  Period: Today"
                 }.onFailure { error ->
-                    setDashboardUnavailable(error.message ?: "Could not load Main Server SMS totals.")
+                    setDashboardUnavailable(
+                        error.message ?: "Could not load Main Server SMS totals."
+                    )
                 }
             }
         }
@@ -689,39 +804,217 @@ class MainActivity : Activity() {
     }
 
     private fun showSmsLogsPage() {
-        showPage("SMS Logs") { page ->
-            addPageMessage(page, "Loading the latest SMS records from Main Server. Delivery is shown separately from Android send success.")
-            val loading = textView("Loading SMS logs…", 13f, textMuted, false)
+        showPage("Institution SMS Report") { page ->
+            if (!SecureConfig.isOrganizationVerified(this)) {
+                addPageMessage(page, "Institution is not verified. Verify this institution with Main Server before viewing SMS reports.", Color.rgb(185, 28, 28))
+                return@showPage
+            }
+
+            val institutionId = SecureConfig.getClientInstitutionId(this)
+            val institutionCode = SecureConfig.getOrganizationCode(this)
+            val institutionName = SecureConfig.getOrganizationName(this)
+            if (institutionId.isBlank() || institutionCode.isBlank()) {
+                addPageMessage(page, "Verified institution identity is incomplete. Re-verify this institution.", Color.rgb(185, 28, 28))
+                return@showPage
+            }
+
+            addPageMessage(
+                page,
+                "Institution: $institutionName\nOnly SMS records belonging to this verified institution are shown. Other institutions are excluded."
+            )
+
+            val loading = textView("Loading institution SMS report…", 13f, textMuted, false)
             page.addView(loading)
-            ApiClient.getConfigured("/api/v1/sms/device_reports.php?view=logs&limit=50") { result ->
+
+            val reportPath = "/api/v1/sms/device_reports.php?view=logs&limit=50" +
+                "&client_institution_id=${android.net.Uri.encode(institutionId)}" +
+                "&institution_code=${android.net.Uri.encode(institutionCode)}"
+            ApiClient.getConfigured(reportPath) { result ->
                 runOnUiThread {
                     page.removeView(loading)
                     result.onSuccess { response ->
                         if (!response.optBoolean("ok", false)) {
-                            addPageMessage(page, response.optString("message", "SMS Logs API is not available."), Color.rgb(185, 28, 28))
+                            addPageMessage(
+                                page,
+                                response.optString("message", "SMS report API is not available."),
+                                Color.rgb(185, 28, 28)
+                            )
                         } else {
                             val rows = response.optJSONArray("items")
                             if (rows == null || rows.length() == 0) {
-                                addPageMessage(page, "No SMS records were returned for this verified Gateway device.")
+                                addPageMessage(
+                                    page,
+                                    "No SMS records were returned for this verified Gateway device."
+                                )
                             } else {
+                                var shownCount = 0
                                 for (i in 0 until rows.length()) {
                                     val item = rows.optJSONObject(i) ?: continue
-                                    val status = item.optString("status", "unknown").uppercase()
-                                    val detail = "${item.optString("created_at", "Time unavailable")}\n" +
-                                        "To: ${item.optString("recipient_masked", "Hidden")}\n" +
-                                        "Status: $status\n" +
-                                        "Request: ${item.optString("request_id", "—")}\n" +
-                                        "Error: ${item.optString("error_code", "—")}"
-                                    addPageMessage(page, detail, if (status == "FAILED") Color.rgb(185, 28, 28) else textDark)
+
+                                    fun firstValue(vararg keys: String, fallback: String = "—"): String {
+                                        for (key in keys) {
+                                            val value = item.optString(key, "").trim()
+                                            if (value.isNotEmpty() && value != "null") return value
+                                        }
+                                        return fallback
+                                    }
+
+                                    val rowInstitutionId = firstValue(
+                                        "client_institution_id", "clientInstitutionId",
+                                        "institution_id", "institutionId", fallback = ""
+                                    )
+                                    val rowInstitutionCode = firstValue(
+                                        "institution_code", "institutionCode",
+                                        "organization_code", "organizationCode", fallback = ""
+                                    )
+                                    // Fail closed: do not display records whose tenant cannot be
+                                    // matched to the locally verified institution identity.
+                                    val belongsToVerifiedInstitution =
+                                        rowInstitutionId == institutionId ||
+                                        (rowInstitutionCode.isNotBlank() &&
+                                            rowInstitutionCode.equals(institutionCode, ignoreCase = true))
+                                    if (!belongsToVerifiedInstitution) continue
+                                    shownCount++
+
+                                    val school = institutionName
+                                    val attendance = firstValue(
+                                        "attendance_status", "attendance", "event_status",
+                                        "submitted_status", "reason"
+                                    )
+                                    val mobile = firstValue(
+                                        "recipient_masked", "mobile_masked", "phone_masked",
+                                        "recipient", fallback = "Hidden"
+                                    )
+                                    val status = firstValue(
+                                        "delivery_status", "gateway_status", "status",
+                                        fallback = "UNKNOWN"
+                                    ).uppercase()
+                                    val apiCode = firstValue("api_code", "code", "error_code")
+                                    val httpCode = firstValue("http_status", "http_code", "http", fallback = "—")
+                                    val requestId = firstValue("request_id", "requestId")
+                                    val createdAt = firstValue("created_at", "requested_at", "timestamp", fallback = "Time unavailable")
+                                    val message = firstValue("message", "status_message", "description", fallback = "")
+                                    val gatewayResult = firstValue(
+                                        "gateway_result", "device_result", "send_result",
+                                        fallback = "Not reported"
+                                    )
+                                    val statusColor = when (status) {
+                                        "DELIVERED" -> Color.rgb(21, 128, 61)
+                                        "SENT", "SUBMITTED" -> Color.rgb(194, 120, 3)
+                                        "FAILED", "REJECTED" -> Color.rgb(185, 28, 28)
+                                        else -> Color.rgb(37, 99, 175)
+                                    }
+                                    val statusMeaning = when (status) {
+                                        "ACCEPTED", "QUEUED", "SMS_QUEUED" ->
+                                            "Main Server accepted / queued this request. This does NOT prove delivery. Check Android Gateway poll, claim and send result."
+                                        "SENT", "SUBMITTED" ->
+                                            "Android Gateway confirmed SMS sending. This does NOT prove delivery."
+                                        "DELIVERED" ->
+                                            "A delivery receipt/status has been confirmed."
+                                        "FAILED", "REJECTED" ->
+                                            "The request or SMS failed. Check the API code and error message below."
+                                        else ->
+                                            "Final delivery state is not confirmed yet. Check the latest Gateway result."
+                                    }
+
+                                    val card = createCard()
+                                    card.addView(
+                                        textView(school, 18f, navy, true)
+                                    )
+                                    card.addView(
+                                        textView(
+                                            "SMS DELIVERY REPORT",
+                                            10f,
+                                            textMuted,
+                                            true
+                                        ).apply { setPadding(0, dp(3), 0, dp(10)) }
+                                    )
+                                    card.addView(
+                                        textView(
+                                            status.replace('_', ' '),
+                                            16f,
+                                            statusColor,
+                                            true
+                                        )
+                                    )
+                                    card.addView(
+                                        textView(
+                                            "Attendance: $attendance\nMobile: $mobile\nTime: $createdAt",
+                                            12f,
+                                            textDark,
+                                            false
+                                        ).apply {
+                                            setPadding(0, dp(9), 0, dp(9))
+                                            setLineSpacing(dp(3).toFloat(), 1f)
+                                        }
+                                    )
+                                    card.addView(
+                                        textView(
+                                            "API Code: $apiCode    HTTP: $httpCode\nRequest ID: $requestId\nGateway Result: $gatewayResult",
+                                            11f,
+                                            textMuted,
+                                            false
+                                        ).apply {
+                                            setPadding(0, dp(5), 0, dp(8))
+                                            setLineSpacing(dp(3).toFloat(), 1f)
+                                        }
+                                    )
+                                    if (message.isNotBlank()) {
+                                        card.addView(
+                                            textView(message, 12f, textDark, false).apply {
+                                                setPadding(0, dp(3), 0, dp(7))
+                                            }
+                                        )
+                                    }
+                                    card.addView(
+                                        textView(
+                                            statusMeaning,
+                                            12f,
+                                            statusColor,
+                                            true
+                                        ).apply {
+                                            setPadding(dp(10), dp(9), dp(10), dp(9))
+                                            background = roundedBackground(
+                                                when (status) {
+                                                    "DELIVERED" -> Color.rgb(230, 246, 237)
+                                                    "SENT", "SUBMITTED" -> Color.rgb(255, 247, 230)
+                                                    "FAILED", "REJECTED" -> Color.rgb(254, 236, 236)
+                                                    else -> Color.rgb(235, 244, 255)
+                                                },
+                                                10
+                                            )
+                                        }
+                                    )
+                                    page.addView(
+                                        card,
+                                        LinearLayout.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.WRAP_CONTENT
+                                        ).apply { bottomMargin = dp(12) }
+                                    )
+                                }
+                                if (shownCount == 0) {
+                                    addPageMessage(
+                                        page,
+                                        "No SMS records matched this verified institution. Records without a matching institution ID/code are hidden for tenant isolation."
+                                    )
                                 }
                             }
                         }
                     }.onFailure { error ->
-                        addPageMessage(page, "Could not load SMS logs: ${error.message ?: "Network error"}", Color.rgb(185, 28, 28))
+                        addPageMessage(
+                            page,
+                            "Could not load SMS delivery report: ${error.message ?: "Network error"}",
+                            Color.rgb(185, 28, 28)
+                        )
                     }
                 }
             }
-            page.addView(actionButton("Refresh Logs", blue) { showSmsLogsPage() }, buttonLayout())
+
+            page.addView(
+                actionButton("Refresh Report", blue) { showSmsLogsPage() },
+                buttonLayout()
+            )
         }
     }
 
@@ -737,7 +1030,21 @@ class MainActivity : Activity() {
             addPageMessage(page, "Period: ${period.uppercase()} • Main Server totals for this verified Gateway device. Delivered means a confirmed delivery receipt, not merely Android send success.")
             val loading = textView("Loading report…", 13f, textMuted, false)
             page.addView(loading)
-            ApiClient.getConfigured("/api/v1/sms/device_reports.php?view=summary&period=$period") { result ->
+            if (!SecureConfig.isOrganizationVerified(this)) {
+                addPageMessage(page, "Institution is not verified. Verify this institution before viewing reports.", Color.rgb(185, 28, 28))
+                return@showPage
+            }
+            val institutionId = SecureConfig.getClientInstitutionId(this)
+            val institutionCode = SecureConfig.getOrganizationCode(this)
+            if (institutionId.isBlank() || institutionCode.isBlank()) {
+                addPageMessage(page, "Verified institution identity is incomplete. Re-verify this institution.", Color.rgb(185, 28, 28))
+                return@showPage
+            }
+            ApiClient.getConfigured(
+                "/api/v1/sms/device_reports.php?view=summary&period=$period" +
+                    "&client_institution_id=${android.net.Uri.encode(institutionId)}" +
+                    "&institution_code=${android.net.Uri.encode(institutionCode)}"
+            ) { result ->
                 runOnUiThread {
                     page.removeView(loading)
                     result.onSuccess { response ->
